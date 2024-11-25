@@ -67,6 +67,7 @@
  * - (idx + 1 < argc) validation added in parse_loglevel()
  */
 
+#include <pthread.h>
 #include <string.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -97,6 +98,7 @@
 #include "fftools_fopen_utf8.h"
 #include "fftools_opt_common.h"
 #include "ffmpegkit_exception.h"
+#include "libavutil/bprint.h"
 #ifdef _WIN32
 #include <windows.h>
 #include "compat/w32dlfcn.h"
@@ -111,6 +113,9 @@ __thread AVDictionary *format_opts, *codec_opts;
 
 __thread int hide_banner = 0;
 __thread int longjmp_value = 0;
+
+/** Holds the id of the current session */
+__thread long globalSessionId = 0;
 
 void uninit_opts(void)
 {
@@ -1068,4 +1073,157 @@ double get_rotation(int32_t *displaymatrix)
                "and contact the ffmpeg-devel mailing list. (ffmpeg-devel@ffmpeg.org)");
 
     return theta;
+}
+
+const char *avutil_log_get_level_str(int level)
+{
+    switch (level)
+    {
+    case AV_LOG_STDERR:
+        return "stderr";
+    case AV_LOG_QUIET:
+        return "quiet";
+    case AV_LOG_DEBUG:
+        return "debug";
+    case AV_LOG_VERBOSE:
+        return "verbose";
+    case AV_LOG_INFO:
+        return "info";
+    case AV_LOG_WARNING:
+        return "warning";
+    case AV_LOG_ERROR:
+        return "error";
+    case AV_LOG_FATAL:
+        return "fatal";
+    case AV_LOG_PANIC:
+        return "panic";
+    default:
+        return "";
+    }
+}
+
+void avutil_log_format_line(void *avcl, int level, const char *fmt, va_list vl, AVBPrint part[4], int *print_prefix)
+{
+    int flags = av_log_get_flags();
+    AVClass *avc = avcl ? *(AVClass **)avcl : NULL;
+    av_bprint_init(part + 0, 0, 1);
+    av_bprint_init(part + 1, 0, 1);
+    av_bprint_init(part + 2, 0, 1);
+    av_bprint_init(part + 3, 0, 65536);
+
+    if (*print_prefix && avc)
+    {
+        if (avc->parent_log_context_offset)
+        {
+            AVClass **parent = *(AVClass ***)(((uint8_t *)avcl) +
+                                              avc->parent_log_context_offset);
+            if (parent && *parent)
+            {
+                av_bprintf(part + 0, "[%s @ %p] ",
+                           (*parent)->item_name(parent), parent);
+            }
+        }
+        av_bprintf(part + 1, "[%s @ %p] ",
+                   avc->item_name(avcl), avcl);
+    }
+
+    if (*print_prefix && (level > AV_LOG_QUIET) && (flags & AV_LOG_PRINT_LEVEL))
+        av_bprintf(part + 2, "[%s] ", avutil_log_get_level_str(level));
+
+    av_vbprintf(part + 3, fmt, vl);
+
+    if (*part[0].str || *part[1].str || *part[2].str || *part[3].str)
+    {
+        char lastc = part[3].len && part[3].len <= part[3].size ? part[3].str[part[3].len - 1] : 0;
+        *print_prefix = lastc == '\n' || lastc == '\r';
+    }
+}
+
+void avutil_log_sanitize(uint8_t *line)
+{
+    while (*line)
+    {
+        if (*line < 0x08 || (*line > 0x0D && *line < 0x20))
+            *line = '?';
+        line++;
+    }
+}
+
+void mutexInit(pthread_mutex_t *lockMutex)
+{
+    pthread_mutexattr_t attributes;
+    pthread_mutexattr_init(&attributes);
+    pthread_mutexattr_settype(&attributes, PTHREAD_MUTEX_RECURSIVE_NP);
+
+    pthread_mutex_init(lockMutex, &attributes);
+    pthread_mutexattr_destroy(&attributes);
+}
+
+void monitorInit(pthread_mutex_t *monitorMutex, pthread_cond_t *monitorCondition)
+{
+    pthread_mutexattr_t attributes;
+    pthread_mutexattr_init(&attributes);
+    pthread_mutexattr_settype(&attributes, PTHREAD_MUTEX_RECURSIVE_NP);
+
+    pthread_condattr_t cattributes;
+    pthread_condattr_init(&cattributes);
+    pthread_condattr_setpshared(&cattributes, PTHREAD_PROCESS_PRIVATE);
+
+    pthread_mutex_init(monitorMutex, &attributes);
+    pthread_mutexattr_destroy(&attributes);
+
+    pthread_cond_init(monitorCondition, &cattributes);
+    pthread_condattr_destroy(&cattributes);
+}
+
+void mutexUnInit(pthread_mutex_t *lockMutex)
+{
+    pthread_mutex_destroy(lockMutex);
+}
+
+void monitorUnInit(pthread_mutex_t *monitorMutex, pthread_cond_t *monitorCondition)
+{
+    pthread_mutex_destroy(monitorMutex);
+    pthread_cond_destroy(monitorCondition);
+}
+
+void mutexLock(pthread_mutex_t *lockMutex)
+{
+    pthread_mutex_lock(lockMutex);
+}
+
+void mutexUnlock(pthread_mutex_t *lockMutex)
+{
+    pthread_mutex_unlock(lockMutex);
+}
+
+void monitorWait(pthread_mutex_t *monitorMutex, pthread_cond_t *monitorCondition, int milliSeconds)
+{
+    struct timeval tp;
+    struct timespec ts;
+    int rc;
+
+    rc = gettimeofday(&tp, NULL);
+    if (rc)
+    {
+        return;
+    }
+
+    ts.tv_sec = tp.tv_sec;
+    ts.tv_nsec = tp.tv_usec * 1000;
+    ts.tv_sec += milliSeconds / 1000;
+    ts.tv_nsec += (milliSeconds % 1000) * 1000000;
+    ts.tv_sec += ts.tv_nsec / 1000000000L;
+    ts.tv_nsec = ts.tv_nsec % 1000000000L;
+
+    pthread_mutex_lock(monitorMutex);
+    pthread_cond_timedwait(monitorCondition, monitorMutex, &ts);
+    pthread_mutex_unlock(monitorMutex);
+}
+
+void monitorNotify(pthread_mutex_t *monitorMutex, pthread_cond_t *monitorCondition)
+{
+    pthread_mutex_lock(monitorMutex);
+    pthread_cond_signal(monitorCondition);
+    pthread_mutex_unlock(monitorMutex);
 }

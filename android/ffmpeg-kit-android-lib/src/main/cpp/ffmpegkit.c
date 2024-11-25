@@ -33,24 +33,6 @@
 # define LogType 1
 # define StatisticsType 2
 
-/** Callback data structure */
-struct CallbackData {
-  int type;                 // 1 (log callback) or 2 (statistics callback)
-  long sessionId;           // session identifier
-
-  int logLevel;             // log level
-  AVBPrint logData;         // log data
-
-  int statisticsFrameNumber;        // statistics frame number
-  float statisticsFps;              // statistics fps
-  float statisticsQuality;          // statistics quality
-  int64_t statisticsSize;           // statistics size
-  double statisticsTime;            // statistics time
-  double statisticsBitrate;         // statistics bitrate
-  double statisticsSpeed;           // statistics speed
-
-  struct CallbackData *next;
-};
 
 /** Session control variables */
 #define SESSION_MAP_SIZE 1000
@@ -65,8 +47,8 @@ static pthread_cond_t monitorCondition;
 pthread_t callbackThread;
 int redirectionEnabled;
 
-struct CallbackData *callbackDataHead;
-struct CallbackData *callbackDataTail;
+static struct CallbackData *callbackDataHead;
+static struct CallbackData *callbackDataTail;
 
 /** Global reference to the virtual machine running */
 static JavaVM *globalVm;
@@ -106,7 +88,7 @@ volatile int handleSIGXCPU = 1;
 volatile int handleSIGPIPE = 1;
 
 /** Holds the id of the current session */
-__thread long globalSessionId = 0;
+extern __thread long globalSessionId;
 
 /** Holds the default log level */
 int configuredLogLevel = AV_LOG_INFO;
@@ -131,142 +113,6 @@ JNINativeMethod configMethods[] = {
 
 /** Forward declaration for function defined in fftools_ffmpeg.c */
 int ffmpeg_execute(int argc, char **argv);
-
-static const char *avutil_log_get_level_str(int level) {
-    switch (level) {
-    case AV_LOG_STDERR:
-        return "stderr";
-    case AV_LOG_QUIET:
-        return "quiet";
-    case AV_LOG_DEBUG:
-        return "debug";
-    case AV_LOG_VERBOSE:
-        return "verbose";
-    case AV_LOG_INFO:
-        return "info";
-    case AV_LOG_WARNING:
-        return "warning";
-    case AV_LOG_ERROR:
-        return "error";
-    case AV_LOG_FATAL:
-        return "fatal";
-    case AV_LOG_PANIC:
-        return "panic";
-    default:
-        return "";
-    }
-}
-
-static void avutil_log_format_line(void *avcl, int level, const char *fmt, va_list vl, AVBPrint part[4], int *print_prefix) {
-    int flags = av_log_get_flags();
-    AVClass* avc = avcl ? *(AVClass **) avcl : NULL;
-    av_bprint_init(part+0, 0, 1);
-    av_bprint_init(part+1, 0, 1);
-    av_bprint_init(part+2, 0, 1);
-    av_bprint_init(part+3, 0, 65536);
-
-    if (*print_prefix && avc) {
-        if (avc->parent_log_context_offset) {
-            AVClass** parent = *(AVClass ***) (((uint8_t *) avcl) +
-                                   avc->parent_log_context_offset);
-            if (parent && *parent) {
-                av_bprintf(part+0, "[%s @ %p] ",
-                         (*parent)->item_name(parent), parent);
-            }
-        }
-        av_bprintf(part+1, "[%s @ %p] ",
-                 avc->item_name(avcl), avcl);
-    }
-
-    if (*print_prefix && (level > AV_LOG_QUIET) && (flags & AV_LOG_PRINT_LEVEL))
-        av_bprintf(part+2, "[%s] ", avutil_log_get_level_str(level));
-
-    av_vbprintf(part+3, fmt, vl);
-
-    if(*part[0].str || *part[1].str || *part[2].str || *part[3].str) {
-        char lastc = part[3].len && part[3].len <= part[3].size ? part[3].str[part[3].len - 1] : 0;
-        *print_prefix = lastc == '\n' || lastc == '\r';
-    }
-}
-
-static void avutil_log_sanitize(uint8_t *line) {
-    while(*line){
-        if(*line < 0x08 || (*line > 0x0D && *line < 0x20))
-            *line='?';
-        line++;
-    }
-}
-
-void mutexInit() {
-    pthread_mutexattr_t attributes;
-    pthread_mutexattr_init(&attributes);
-    pthread_mutexattr_settype(&attributes, PTHREAD_MUTEX_RECURSIVE_NP);
-
-    pthread_mutex_init(&lockMutex, &attributes);
-    pthread_mutexattr_destroy(&attributes);
-}
-
-void monitorInit() {
-    pthread_mutexattr_t attributes;
-    pthread_mutexattr_init(&attributes);
-    pthread_mutexattr_settype(&attributes, PTHREAD_MUTEX_RECURSIVE_NP);
-
-    pthread_condattr_t cattributes;
-    pthread_condattr_init(&cattributes);
-    pthread_condattr_setpshared(&cattributes, PTHREAD_PROCESS_PRIVATE);
-
-    pthread_mutex_init(&monitorMutex, &attributes);
-    pthread_mutexattr_destroy(&attributes);
-
-    pthread_cond_init(&monitorCondition, &cattributes);
-    pthread_condattr_destroy(&cattributes);
-}
-
-void mutexUnInit() {
-    pthread_mutex_destroy(&lockMutex);
-}
-
-void monitorUnInit() {
-    pthread_mutex_destroy(&monitorMutex);
-    pthread_cond_destroy(&monitorCondition);
-}
-
-void mutexLock() {
-    pthread_mutex_lock(&lockMutex);
-}
-
-void mutexUnlock() {
-    pthread_mutex_unlock(&lockMutex);
-}
-
-void monitorWait(int milliSeconds) {
-    struct timeval tp;
-    struct timespec ts;
-    int rc;
-
-    rc = gettimeofday(&tp, NULL);
-    if (rc) {
-        return;
-    }
-
-    ts.tv_sec  = tp.tv_sec;
-    ts.tv_nsec = tp.tv_usec * 1000;
-    ts.tv_sec += milliSeconds / 1000;
-    ts.tv_nsec += (milliSeconds % 1000)*1000000;
-    ts.tv_sec += ts.tv_nsec / 1000000000L;
-    ts.tv_nsec = ts.tv_nsec % 1000000000L;
-
-    pthread_mutex_lock(&monitorMutex);
-    pthread_cond_timedwait(&monitorCondition, &monitorMutex, &ts);
-    pthread_mutex_unlock(&monitorMutex);
-}
-
-void monitorNotify() {
-    pthread_mutex_lock(&monitorMutex);
-    pthread_cond_signal(&monitorCondition);
-    pthread_mutex_unlock(&monitorMutex);
-}
-
 /**
  * Adds log data to the end of callback data list.
  *
@@ -284,7 +130,7 @@ void logCallbackDataAdd(int level, AVBPrint *data) {
     av_bprintf(&newData->logData, "%s", data->str);
     newData->next = NULL;
 
-    mutexLock();
+    mutexLock(&lockMutex);
 
     // INSERT IT TO THE END OF QUEUE
     if (callbackDataTail == NULL) {
@@ -302,9 +148,9 @@ void logCallbackDataAdd(int level, AVBPrint *data) {
         callbackDataTail = newData;
     }
 
-    mutexUnlock();
+    mutexUnlock(&lockMutex);
 
-    monitorNotify();
+    monitorNotify(&monitorMutex, &monitorCondition);
 
     atomic_fetch_add(&sessionInTransitMessageCountMap[globalSessionId % SESSION_MAP_SIZE], 1);
 }
@@ -328,7 +174,7 @@ void statisticsCallbackDataAdd(int frameNumber, float fps, float quality, int64_
 
     newData->next = NULL;
 
-    mutexLock();
+    mutexLock(&lockMutex);
 
     // INSERT IT TO THE END OF QUEUE
     if (callbackDataTail == NULL) {
@@ -346,9 +192,9 @@ void statisticsCallbackDataAdd(int frameNumber, float fps, float quality, int64_
         callbackDataTail = newData;
     }
 
-    mutexUnlock();
+    mutexUnlock(&lockMutex);
 
-    monitorNotify();
+    monitorNotify(&monitorMutex, &monitorCondition);
 
     atomic_fetch_add(&sessionInTransitMessageCountMap[globalSessionId % SESSION_MAP_SIZE], 1);
 }
@@ -368,7 +214,7 @@ void addSession(long id) {
 struct CallbackData *callbackDataRemove() {
     struct CallbackData *currentData;
 
-    mutexLock();
+    mutexLock(&lockMutex);
 
     if (callbackDataHead == NULL) {
         currentData = NULL;
@@ -389,7 +235,7 @@ struct CallbackData *callbackDataRemove() {
         }
     }
 
-    mutexUnlock();
+    mutexUnlock(&lockMutex);
 
     return currentData;
 }
@@ -552,7 +398,7 @@ void *callbackThreadFunction() {
             av_free(callbackData);
 
         } else {
-            monitorWait(100);
+            monitorWait(&monitorMutex, &monitorCondition, 100);
         }
     }
 
@@ -585,15 +431,15 @@ int saf_close(int fd) {
  * Used by JNI methods to enable redirection.
  */
 static void enableNativeRedirection() {
-    mutexLock();
+    mutexLock(&lockMutex);
 
     if (redirectionEnabled != 0) {
-        mutexUnlock();
+        mutexUnlock(&lockMutex);
         return;
     }
     redirectionEnabled = 1;
 
-    mutexUnlock();
+    mutexUnlock(&lockMutex);
 
     int rc = pthread_create(&callbackThread, 0, callbackThreadFunction, 0);
     if (rc != 0) {
@@ -681,8 +527,8 @@ jint JNI_OnLoad(JavaVM *vm, void *reserved) {
         atomic_init(&sessionInTransitMessageCountMap[i], 0);
     }
 
-    mutexInit();
-    monitorInit();
+    mutexInit(&lockMutex);
+    monitorInit(&monitorMutex, &monitorCondition);
 
     redirectionEnabled = 0;
 
@@ -733,20 +579,20 @@ JNIEXPORT void JNICALL Java_com_arthenica_ffmpegkit_FFmpegKitConfig_enableNative
  */
 JNIEXPORT void JNICALL Java_com_arthenica_ffmpegkit_FFmpegKitConfig_disableNativeRedirection(JNIEnv *env, jclass object) {
 
-    mutexLock();
+    mutexLock(&lockMutex);
 
     if (redirectionEnabled != 1) {
-        mutexUnlock();
+        mutexUnlock(&lockMutex);
         return;
     }
     redirectionEnabled = 0;
 
-    mutexUnlock();
+    mutexUnlock(&lockMutex);
 
     av_log_set_callback(av_log_default_callback);
     set_report_callback(NULL);
 
-    monitorNotify();
+    monitorNotify(&monitorMutex, &monitorCondition);
 }
 
 /**

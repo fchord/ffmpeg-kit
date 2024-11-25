@@ -71,6 +71,7 @@
 #include "libavfilter/avfilter.h"
 #include "libavformat/avformat.h"
 #include "libswscale/swscale.h"
+#include "libavutil/bprint.h"
 
 #ifdef _WIN32
 #undef main /* We don't want SDL to override our main() */
@@ -512,5 +513,50 @@ void *allocate_array_elem(void *array, size_t elem_size, int *nb_elems);
     snprintf(name, sizeof(name), "%d", rate);
 
 double get_rotation(int32_t *displaymatrix);
+
+/** Callback data structure */
+struct CallbackData
+{
+    int type;       // 1 (log callback) or 2 (statistics callback)
+    long sessionId; // session identifier
+
+    int logLevel;     // log level
+    AVBPrint logData; // log data
+
+    int statisticsFrameNumber; // statistics frame number
+    float statisticsFps;       // statistics fps
+    float statisticsQuality;   // statistics quality
+    int64_t statisticsSize;    // statistics size
+    double statisticsTime;     // statistics time
+    double statisticsBitrate;  // statistics bitrate
+    double statisticsSpeed;    // statistics speed
+
+    struct CallbackData *next;
+};
+
+#define LogType 1
+#define StatisticsType 2
+
+const char *avutil_log_get_level_str(int level);
+
+void avutil_log_format_line(void *avcl, int level, const char *fmt, va_list vl, AVBPrint part[4], int *print_prefix);
+
+void avutil_log_sanitize(uint8_t *line);
+
+void mutexInit(pthread_mutex_t *lockMutex);
+
+void monitorInit(pthread_mutex_t *monitorMutex, pthread_cond_t *monitorCondition);
+
+void mutexUnInit(pthread_mutex_t *lockMutex);
+
+void monitorUnInit(pthread_mutex_t *monitorMutex, pthread_cond_t *monitorCondition);
+
+void mutexLock(pthread_mutex_t *lockMutex);
+
+void mutexUnlock(pthread_mutex_t *lockMutex);
+
+void monitorWait(pthread_mutex_t *monitorMutex, pthread_cond_t *monitorCondition, int milliSeconds);
+
+void monitorNotify(pthread_mutex_t *monitorMutex, pthread_cond_t *monitorCondition);
 
 #endif /* FFTOOLS_CMDUTILS_H */

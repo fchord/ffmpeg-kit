@@ -40,6 +40,7 @@ public class FFmpegKit {
     static {
         AbiDetect.class.getName();
         FFmpegKitConfig.class.getName();
+        FFplayKit.class.getName();
     }
 
     /**

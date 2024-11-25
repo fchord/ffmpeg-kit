@@ -7,14 +7,14 @@ make distclean 2>/dev/null 1>/dev/null
 if [[ ! -f "${BASEDIR}"/src/"${LIB_NAME}"/configure ]] || [[ ${RECONF_sdl} -eq 1 ]]; then
   autoreconf_library "${LIB_NAME}" 1>>"${BASEDIR}"/build.log 2>&1 || return 1
 fi
-
+LD=ld
 ./configure \
   --prefix="${LIB_INSTALL_PREFIX}" \
   --with-pic \
   --without-x \
   --with-sysroot="${ANDROID_SYSROOT}" \
   --enable-static \
-  --disable-shared \
+  --enable-shared \
   --disable-fast-install \
   --host="${HOST}" || return 1
 

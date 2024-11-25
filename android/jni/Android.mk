@@ -1,6 +1,13 @@
 MY_LOCAL_PATH := $(call my-dir)
 $(call import-add-path, $(MY_LOCAL_PATH))
 
+include $(CLEAR_VARS)
+LOCAL_MODULE := MY_SDL2
+LOCAL_PATH := $(MY_LOCAL_PATH)/../../prebuilt/android-arm64/sdl/lib
+LOCAL_SRC_FILES := libSDL2.so
+$(info LOCAL_SRC_FILES: $(LOCAL_SRC_FILES))
+include $(PREBUILT_SHARED_LIBRARY)
+
 MY_ARMV7 := false
 MY_ARMV7_NEON := false
 ifeq ($(TARGET_ARCH_ABI), armeabi-v7a)
@@ -29,6 +36,10 @@ else
 endif
 
 FFMPEG_INCLUDES := $(MY_LOCAL_PATH)/../../prebuilt/$(MY_BUILD_DIR)/ffmpeg/include
+$(info FFMPEG_INCLUDES: $(FFMPEG_INCLUDES))
+SRC_FFMPEG := $(MY_LOCAL_PATH)/../../src/ffmpeg
+SDL_INCLUDE := $(MY_LOCAL_PATH)/../../prebuilt/android-arm64/sdl/include/SDL2
+SRC_FFMPEG_TOOLS := $(MY_LOCAL_PATH)/../../src/ffmpeg/fftools
 
 MY_ARM_MODE := arm
 MY_ARM_NEON := false
@@ -56,6 +67,8 @@ ifeq ($(TARGET_ARCH_ABI), x86_64)
     MY_ARM_NEON := true
 endif
 
+
+
 include $(CLEAR_VARS)
 LOCAL_ARM_MODE := $(MY_ARM_MODE)
 LOCAL_MODULE := ffmpegkit_abidetect
@@ -70,6 +83,7 @@ include $(BUILD_SHARED_LIBRARY)
 $(call import-module, cpu-features)
 
 MY_SRC_FILES := ffmpegkit.c ffprobekit.c ffmpegkit_exception.c fftools_cmdutils.c fftools_ffmpeg.c fftools_ffprobe.c fftools_ffmpeg_mux.c fftools_ffmpeg_mux_init.c fftools_ffmpeg_demux.c fftools_ffmpeg_opt.c fftools_opt_common.c fftools_ffmpeg_hw.c fftools_ffmpeg_filter.c fftools_objpool.c fftools_sync_queue.c fftools_thread_queue.c
+MY_SRC_FILES += ffplaykit.c
 
 ifeq ($(TARGET_PLATFORM),android-16)
     MY_SRC_FILES += android_lts_support.c
@@ -107,12 +121,17 @@ endif
 ifeq ($(MY_BUILD_GENERIC_FFMPEG_KIT), true)
     include $(CLEAR_VARS)
     LOCAL_PATH := $(MY_LOCAL_PATH)/../ffmpeg-kit-android-lib/src/main/cpp
+    $(info LOCAL_PATH: $(LOCAL_PATH))
     LOCAL_ARM_MODE := $(MY_ARM_MODE)
     LOCAL_MODULE := ffmpegkit
     LOCAL_SRC_FILES := $(MY_SRC_FILES)
+    LOCAL_C_INCLUDES := $(SRC_FFMPEG)
+    LOCAL_C_INCLUDES += $(SDL_INCLUDE)
+    LOCAL_C_INCLUDES += $(SRC_FFMPEG_TOOLS)
     LOCAL_CFLAGS := $(MY_CFLAGS)
     LOCAL_LDLIBS := $(MY_LDLIBS)
     LOCAL_SHARED_LIBRARIES := libavfilter libavformat libavcodec libavutil libswresample libavdevice libswscale
+    LOCAL_SHARED_LIBRARIES += libMY_SDL2
     ifeq ($(APP_STL), c++_shared)
         LOCAL_SHARED_LIBRARIES += c++_shared # otherwise NDK will not add the library for packaging
     endif
