@@ -10,10 +10,18 @@ public class FFplayKit {
      */
     static final String TAG = "ffmpeg-kit";
 
-    public static int playWithArguments(final String arguments) {
-        int returnCode = nativeFFplayExecute(arguments);
+    public static int playTest(final String arguments) {
+        int returnCode = nativeFFplayTest(arguments);
         android.util.Log.w(
-                FFplayKit.TAG, String.format("playWithArguments: %s, returnCode: %s",
+                FFplayKit.TAG, String.format("playTest: %s, returnCode: %s",
+                        arguments, Integer.toString(returnCode)));
+        return 0;
+    }
+
+    public static int playCallMain(final String arguments) {
+        int returnCode = nativeFFplayMain(arguments);
+        android.util.Log.w(
+                FFplayKit.TAG, String.format("playCallMain: %s, returnCode: %s",
                         arguments, Integer.toString(returnCode)));
         return 0;
     }
@@ -35,5 +43,5 @@ public class FFplayKit {
     }
     
     public native static int nativeFFplayMain(final String arguments);
-    public native static int nativeFFplayExecute(final String arguments);
+    public native static int nativeFFplayTest(final String arguments);
 }

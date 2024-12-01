@@ -2,11 +2,18 @@ MY_LOCAL_PATH := $(call my-dir)
 $(call import-add-path, $(MY_LOCAL_PATH))
 
 include $(CLEAR_VARS)
-LOCAL_MODULE := MY_SDL2
+LOCAL_MODULE := SDL2
 LOCAL_PATH := $(MY_LOCAL_PATH)/../../prebuilt/android-arm64/sdl/lib
 LOCAL_SRC_FILES := libSDL2.so
+# LOCAL_LDLIBS := -L$(MY_LOCAL_PATH)/../../prebuilt/android-arm64/sdl/lib -lSDL2-2.0.so.0.8.0
 $(info LOCAL_SRC_FILES: $(LOCAL_SRC_FILES))
 include $(PREBUILT_SHARED_LIBRARY)
+
+include $(CLEAR_VARS)
+LOCAL_MODULE := SDL2main
+LOCAL_PATH := $(MY_LOCAL_PATH)/../../prebuilt/android-arm64/sdl/lib
+LOCAL_SRC_FILES := libSDL2main.a
+include $(PREBUILT_STATIC_LIBRARY)
 
 MY_ARMV7 := false
 MY_ARMV7_NEON := false
@@ -131,10 +138,12 @@ ifeq ($(MY_BUILD_GENERIC_FFMPEG_KIT), true)
     LOCAL_CFLAGS := $(MY_CFLAGS)
     LOCAL_LDLIBS := $(MY_LDLIBS)
     LOCAL_SHARED_LIBRARIES := libavfilter libavformat libavcodec libavutil libswresample libavdevice libswscale
-    LOCAL_SHARED_LIBRARIES += libMY_SDL2
+    LOCAL_SHARED_LIBRARIES += libSDL2
     ifeq ($(APP_STL), c++_shared)
         LOCAL_SHARED_LIBRARIES += c++_shared # otherwise NDK will not add the library for packaging
     endif
+    LOCAL_STATIC_LIBRARIES := libSDL2main
+    # LOCAL_STATIC_LIBRARIES := 
     LOCAL_ARM_NEON := ${MY_ARM_NEON}
     include $(BUILD_SHARED_LIBRARY)
 

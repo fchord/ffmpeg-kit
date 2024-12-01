@@ -48,6 +48,7 @@
 
 #include <SDL.h>
 #include <SDL_thread.h>
+#include <SDL_main.h>
 
 #include "fftools_cmdutils.h"
 #include "fftools_opt_common.h"
@@ -164,12 +165,12 @@ typedef struct Frame
 typedef struct FrameQueue
 {
     Frame queue[FRAME_QUEUE_SIZE];
-    int rindex;
-    int windex;
-    int size;
-    int max_size;
-    int keep_last;
-    int rindex_shown;
+    int rindex; // read index
+    int windex; // write index，下一个等待写入的帧
+    int size;   // 当前的帧数
+    int max_size; // 允许最大帧数
+    int keep_last; // default setting: video - 1; audio - 0; sub - 0.
+    int rindex_shown; // rindex是否已经渲染了？
     SDL_mutex *mutex;
     SDL_cond *cond;
     PacketQueue *pktq;
@@ -884,6 +885,7 @@ static Frame *frame_queue_peek_last(FrameQueue *f)
     return &f->queue[f->rindex];
 }
 
+// 拿到windex. 写没写满由size来控制
 static Frame *frame_queue_peek_writable(FrameQueue *f)
 {
     /* wait until we have space to put a new frame */
@@ -918,6 +920,7 @@ static Frame *frame_queue_peek_readable(FrameQueue *f)
     return &f->queue[(f->rindex + f->rindex_shown) % f->max_size];
 }
 
+// 应当已经写入了帧数据，这里只需要把windex++
 static void frame_queue_push(FrameQueue *f)
 {
     if (++f->windex == f->max_size)
@@ -928,6 +931,7 @@ static void frame_queue_push(FrameQueue *f)
     SDL_UnlockMutex(f->mutex);
 }
 
+// 释放一个帧？为什么不叫pop？
 static void frame_queue_next(FrameQueue *f)
 {
     if (f->keep_last && !f->rindex_shown)
@@ -1937,7 +1941,7 @@ static void video_refresh(void *opaque, double *remaining_time)
             video_display(is);
     }
     is->force_refresh = 0;
-    if (show_status)
+    if (show_status && 0)
     {
         AVBPrint buf;
         static int64_t last_time;
@@ -2003,6 +2007,7 @@ static int queue_picture(VideoState *is, AVFrame *src_frame, double pts, double 
     if (!(vp = frame_queue_peek_writable(&is->pictq)))
         return -1;
 
+    // 把解码出来的avframe所有成员move到了frame_queue中。
     vp->sar = src_frame->sample_aspect_ratio;
     vp->uploaded = 0;
 
@@ -2394,6 +2399,7 @@ the_end:
     avfilter_graph_free(&is->agraph);
 #endif
     av_frame_free(&frame);
+    av_log(NULL, AV_LOG_INFO, "audio thread end.");
     return ret;
 }
 
@@ -2515,6 +2521,7 @@ the_end:
     avfilter_graph_free(&graph);
 #endif
     av_frame_free(&frame);
+    av_log(NULL, AV_LOG_INFO, "video thread end.");
     return 0;
 }
 
@@ -2527,8 +2534,10 @@ static int subtitle_thread(void *arg)
 
     for (;;)
     {
-        if (!(sp = frame_queue_peek_writable(&is->subpq)))
+        if (!(sp = frame_queue_peek_writable(&is->subpq))) {
+            av_log(NULL, AV_LOG_INFO, "subtitle thread end.");
             return 0;
+        }
 
         if ((got_subtitle = decoder_decode_frame(&is->subdec, NULL, &sp->sub)) < 0)
             break;
@@ -2553,6 +2562,7 @@ static int subtitle_thread(void *arg)
             avsubtitle_free(&sp->sub);
         }
     }
+    av_log(NULL, AV_LOG_INFO, "subtitle thread end.");
     return 0;
 }
 
@@ -3391,6 +3401,8 @@ static int read_thread(void *arg)
         ret = av_read_frame(ic, pkt);
         if (ret < 0)
         {
+            // 解封装到 End of file后这里会循环。如果设置了autoexit，渲染结束后自动退出线程。
+            // av_log(NULL, AV_LOG_INFO, "av_read_frame ret:%d, %s\n", ret, av_err2str(ret));
             if ((ret == AVERROR_EOF || avio_feof(ic->pb)) && !is->eof)
             {
                 if (is->video_stream >= 0)
@@ -3688,6 +3700,7 @@ static void event_loop(VideoState *cur_stream)
     {
         double x;
         refresh_loop_wait_event(cur_stream, &event);
+        av_log(NULL, AV_LOG_INFO, "event_loop. event: %d\n", event.type);
         switch (event.type)
         {
         case SDL_KEYDOWN:
@@ -3901,6 +3914,12 @@ static void event_loop(VideoState *cur_stream)
         default:
             break;
         }
+        // liuzhi. Thread should quit.
+        if (cur_stream->eof)
+        {
+            do_exit(cur_stream);
+            break;
+        }
     }
 }
 
@@ -4104,9 +4123,10 @@ void show_help_default(const char *opt, const char *arg)
 }
 
 /* Called from the main */
+// 20241128 ffplay_main 
 int main(int argc, char **argv)
 {
-    int flags;
+    int flags, ret;
     VideoState *is;
 
     init_dynload();
@@ -4152,10 +4172,13 @@ int main(int argc, char **argv)
     }
     if (display_disable)
         flags &= ~SDL_INIT_VIDEO;
-    if (SDL_Init(flags))
+    ret = SDL_Init(flags);
+    av_log(NULL, AV_LOG_INFO, "SDL_Init: %d\n", ret);
+    if (ret)
     {
         av_log(NULL, AV_LOG_FATAL, "Could not initialize SDL - %s\n", SDL_GetError());
         av_log(NULL, AV_LOG_FATAL, "(Did you set the DISPLAY variable?)\n");
+        av_log(NULL, AV_LOG_INFO, "flags: 0x%x\n", flags);
         exit(1);
     }
 
@@ -4175,6 +4198,9 @@ int main(int argc, char **argv)
             flags |= SDL_WINDOW_BORDERLESS;
         else
             flags |= SDL_WINDOW_RESIZABLE;
+
+        flags |= SDL_WINDOW_FULLSCREEN;
+        flags |= SDL_WINDOW_OPENGL;
 
 #ifdef SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR
         SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR, "0");
@@ -4218,7 +4244,7 @@ int main(int argc, char **argv)
 
 // <<======  ffplay.c end
 
-int ffplay_main(int argc, char **argv){
+int ffplay_main_bak(int argc, char **argv){
     return 0;
 }
 
@@ -4254,7 +4280,7 @@ JNIEXPORT jint JNICALL Java_com_arthenica_ffmpegkit_FFplayKit_nativeFFplayMain(J
         LOGI("argv[%d] = %s\n", i, argv[i]);
     }
 
-    ffplay_main(argc, argv);
+    main(argc, argv);
 
     // Remember to free memory allocated
     free(char_argu);
@@ -4267,9 +4293,9 @@ JNIEXPORT jint JNICALL Java_com_arthenica_ffmpegkit_FFplayKit_nativeFFplayMain(J
 }
 
 
-JNIEXPORT jint JNICALL Java_com_arthenica_ffmpegkit_FFplayKit_nativeFFplayExecute(JNIEnv *env, jclass object, jstring arguments)
+JNIEXPORT jint JNICALL Java_com_arthenica_ffmpegkit_FFplayKit_nativeFFplayTest(JNIEnv *env, jclass object, jstring arguments)
 {
     int returnCode = 0;
-    LOGI("nativeFFplayExecute!");
+    LOGI("nativeFFplayTest!");
     return returnCode;
 }

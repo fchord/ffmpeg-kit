@@ -14,9 +14,9 @@ JNIEXPORT jint JNICALL Java_com_arthenica_ffmpegkit_FFplayKit_nativeFFplayMain(J
 
 /*
  * Class:     com_arthenica_ffmpegkit_FFplayKit
- * Method:    nativeFFplayExecute
+ * Method:    nativeFFplayTest
  * Signature: (Ljava/lang/String;)I
  */
-JNIEXPORT jint JNICALL Java_com_arthenica_ffmpegkit_FFplayKit_nativeFFplayExecute(JNIEnv *env, jclass object, jstring arguments);
+JNIEXPORT jint JNICALL Java_com_arthenica_ffmpegkit_FFplayKit_nativeFFplayTest(JNIEnv *env, jclass object, jstring arguments);
 
 #endif  /* FFPLAY_KIT_H */

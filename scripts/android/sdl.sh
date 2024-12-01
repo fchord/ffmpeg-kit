@@ -8,6 +8,8 @@ if [[ ! -f "${BASEDIR}"/src/"${LIB_NAME}"/configure ]] || [[ ${RECONF_sdl} -eq 1
   autoreconf_library "${LIB_NAME}" 1>>"${BASEDIR}"/build.log 2>&1 || return 1
 fi
 LD=ld
+LDFLAGS="-Wl,-soname,libSDL2.so"
+LT_LDFLAGS="-Wl,-soname,libSDL2.so"
 ./configure \
   --prefix="${LIB_INSTALL_PREFIX}" \
   --with-pic \
@@ -17,6 +19,10 @@ LD=ld
   --enable-shared \
   --disable-fast-install \
   --host="${HOST}" || return 1
+
+# mv Makefile Makefile_bak
+# cp Makefile_m Makefile
+cp libtool_m libtool
 
 make -j$(get_cpu_count) || return 1
 
