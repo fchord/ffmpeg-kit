@@ -41,7 +41,13 @@ public class FFplayKit {
 
         return stringBuilder.toString();
     }
+
+    public static int playPositionOffset(final Float OffsetX, Float OffsetY) {
+        return nativeFFplayPositionOffset(OffsetX, OffsetY);
+    }
     
     public native static int nativeFFplayMain(final String arguments);
     public native static int nativeFFplayTest(final String arguments);
+    public native static int nativeFFplayPositionOffset(final Float offset_x, Float offset_y);
+
 }

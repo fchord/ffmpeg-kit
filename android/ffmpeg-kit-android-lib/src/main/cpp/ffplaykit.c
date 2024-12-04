@@ -90,7 +90,7 @@ const char program_name_ffplaykit[] = "ffplay";
 #define AUDIO_DIFF_AVG_NB 20
 
 /* polls for possible required screen refresh at least this often, should be less than 1/fps */
-#define REFRESH_RATE 0.01
+#define REFRESH_RATE 0.005
 
 /* NOTE: the size must be big enough to compensate the hardware audio buffersize size */
 /* TODO: We assume that a decoded and resampled frame fits into this buffer */
@@ -309,6 +309,9 @@ typedef struct VideoState
     int last_video_stream, last_audio_stream, last_subtitle_stream;
 
     SDL_cond *continue_read_thread;
+    int video_frame_rendered;
+    int need_refresh_pos;
+    float last_x, last_y;
 } VideoState;
 
 extern __thread long globalSessionId;
@@ -413,6 +416,8 @@ static const struct TextureFormatEntry
     {AV_PIX_FMT_UYVY422, SDL_PIXELFORMAT_UYVY},
     {AV_PIX_FMT_NONE, SDL_PIXELFORMAT_UNKNOWN},
 };
+
+static float render_position_offset[2];
 
 
 /**
@@ -1214,8 +1219,11 @@ static void video_image_display(VideoState *is)
         vp->uploaded = 1;
         vp->flip_v = vp->frame->linesize[0] < 0;
     }
-
-    SDL_RenderCopyEx(renderer, is->vid_texture, NULL, &rect, 0, NULL, vp->flip_v ? SDL_FLIP_VERTICAL : 0);
+    av_log(NULL, AV_LOG_INFO, "render in video_image_display. %d\n", is->video_frame_rendered);
+    static double angle = 0.0;
+    SDL_RenderCopyEx(renderer, is->vid_texture, NULL, &rect, angle, NULL, vp->flip_v ? SDL_FLIP_VERTICAL : 0);
+    // angle += 1.0;
+    is->video_frame_rendered++;
     set_sdl_yuv_conversion_mode(NULL);
     if (sp)
     {
@@ -3490,6 +3498,10 @@ static VideoState *stream_open(const char *filename,
     is->iformat = iformat;
     is->ytop = 0;
     is->xleft = 0;
+    is->video_frame_rendered = 0;
+    is->need_refresh_pos = 0;
+    is->last_x = 0.0;
+    is->last_y = 0.0;
 
     /* start video display */
     if (frame_queue_init(&is->pictq, &is->videoq, VIDEO_PICTURE_QUEUE_SIZE, 1) < 0)
@@ -3656,8 +3668,25 @@ static void refresh_loop_wait_event(VideoState *is, SDL_Event *event)
         if (remaining_time > 0.0)
             av_usleep((int64_t)(remaining_time * 1000000.0));
         remaining_time = REFRESH_RATE;
-        if (is->show_mode != SHOW_MODE_NONE && (!is->paused || is->force_refresh))
+
+        if ((render_position_offset[0] != 0.0 || render_position_offset[1] != 0.0) || (render_position_offset[0] == 0.0 && render_position_offset[1] == 0.0 && (is->last_x != 0.0 || is->last_y != 0.0)))
+        {
+            is->need_refresh_pos = 1;
+            is->force_refresh = 1;
+        }
+        else
+            is->need_refresh_pos = 0;
+        if (is->show_mode != SHOW_MODE_NONE && (!is->paused || is->force_refresh)) {
+            if (!display_disable && renderer && /* is->video_frame_rendered > 0 && */ is->need_refresh_pos)
+            {
+                av_log(NULL, AV_LOG_INFO, "Call SDL_SetVertexPositionOffset in refresh loop: [%f, %f]\n",
+                       render_position_offset[0], render_position_offset[1]);
+                SDL_SetVertexPositionOffset(renderer,
+                                            is->last_x = render_position_offset[0],
+                                            is->last_y = render_position_offset[1]);
+            }
             video_refresh(is, &remaining_time);
+        }
         SDL_PumpEvents();
     }
 }
@@ -3700,7 +3729,7 @@ static void event_loop(VideoState *cur_stream)
     {
         double x;
         refresh_loop_wait_event(cur_stream, &event);
-        av_log(NULL, AV_LOG_INFO, "event_loop. event: %d\n", event.type);
+        // av_log(NULL, AV_LOG_INFO, "event_loop. event: %d\n", event.type);
         switch (event.type)
         {
         case SDL_KEYDOWN:
@@ -4298,4 +4327,26 @@ JNIEXPORT jint JNICALL Java_com_arthenica_ffmpegkit_FFplayKit_nativeFFplayTest(J
     int returnCode = 0;
     LOGI("nativeFFplayTest!");
     return returnCode;
+}
+
+JNIEXPORT jint JNICALL Java_org_libsdl_app_FFplayKit_nativeFFplayPositionOffset(JNIEnv *env, jclass object, jfloat offset_x, jfloat offset_y)
+{
+    int returnCode = 0;
+    LOGI("nativeFFplayPositionOffset: [%f, %f]", offset_x, offset_y);
+    render_position_offset[0] = offset_x;
+    render_position_offset[1] = offset_y;
+    return returnCode;
+}
+
+void ffplaykit_set_position_offset(float x, float y) {
+    render_position_offset[0] = x;
+    render_position_offset[1] = y;
+    // LOGI("ffplaykit_set_position_offset:[%f, %f]", x, y);
+    if (0 && renderer) {
+        LOGI("ffplaykit_set_position_offset call SDL:[%f, %f]", x, y);
+        SDL_SetVertexPositionOffset(renderer,
+                                    render_position_offset[0],
+                                    render_position_offset[1]);
+    }
+        
 }

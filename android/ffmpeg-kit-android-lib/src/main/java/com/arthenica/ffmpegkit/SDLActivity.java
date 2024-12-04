@@ -4,6 +4,8 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.Arrays;
 import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.List;
 
 import android.app.*;
 import android.content.*;
@@ -30,12 +32,19 @@ import android.content.pm.PackageManager;
 import android.content.pm.ApplicationInfo;
 import android.net.Uri;
 import android.provider.Settings;
+import android.widget.Toast;
+import android.provider.DocumentsContract;
+import androidx.documentfile.provider.DocumentFile;
 
 /**
     SDL Activity
 */
 public class SDLActivity extends Activity {
     private static final String TAG = "SDL";
+
+    private static SDLMain sdl_main;
+
+    private static float touchDownPositionX, touchDownPositionY;
 
     public static boolean mIsResumedCalled, mIsSurfaceReady, mHasFocus;
 
@@ -127,7 +136,7 @@ public class SDLActivity extends Activity {
     protected String[] getArguments() {
         // return new String[0];
         String[] str = new String[] { 
-            "-i","/storage/emulated/0/TrumpTalksSocialism.mp4",
+            "-i","/storage/emulated/0/TrumpTalksSocialism.mp4", // TrumpTalksSocialism.mp4, UltimatClarity_h264_1080p.mp4
             "-autoexit"
         };
         return str;
@@ -225,11 +234,47 @@ public class SDLActivity extends Activity {
 
         // Get filename from "Open with" of another application
         Intent intent = getIntent();
-        if (intent != null && intent.getData() != null) {
-            String filename = intent.getData().getPath();
-            if (filename != null) {
-                Log.v(TAG, "Got filename: " + filename);
-                SDLActivity.onNativeDropFile(filename);
+        if (intent != null) {
+            if(intent.getData() != null){
+                String filename = intent.getData().getPath();
+                if (filename != null) {
+                    Log.v(TAG, "Got filename: " + filename);
+                    SDLActivity.onNativeDropFile(filename);
+                }
+            }
+            String directoryPath = intent.getStringExtra("selected_directory");
+            if (directoryPath != null) {
+                Uri directoryUri = Uri.parse(directoryPath);
+                // You can use directoryUri for further operations
+                Toast.makeText(this, "Received Directory: " + directoryUri.toString(), Toast.LENGTH_LONG).show();
+                List<String> videoFiles = scanVideoFiles(directoryUri);
+                for (String filePath : videoFiles) {
+                    Log.d(TAG, "Video file: " + filePath);
+                }
+            }
+        }
+    }
+
+    private List<String> scanVideoFiles(Uri directoryUri) {
+        List<String> videoFiles = new ArrayList<>();
+        DocumentFile directory = DocumentFile.fromTreeUri(this, directoryUri);
+
+        if (directory != null && directory.isDirectory()) {
+            scanDirectory(directory, videoFiles);
+        }
+
+        return videoFiles;
+    }
+
+    private void scanDirectory(DocumentFile directory, List<String> videoFiles) {
+        for (DocumentFile file : directory.listFiles()) {
+            if (file.isDirectory()) {
+                scanDirectory(file, videoFiles); // Recursively scan subdirectories
+            } else {
+                String fileName = file.getName();
+                if (fileName != null && (fileName.endsWith(".mp4") || fileName.endsWith(".mkv"))) {
+                    videoFiles.add(file.getUri().toString());
+                }
             }
         }
     }
@@ -402,8 +447,8 @@ public class SDLActivity extends Activity {
                     // This is the entry point to the C app.
                     // Start up the C app thread and enable sensor input for the first time
                     // FIXME: Why aren't we enabling sensor input at start?
-
-                    mSDLThread = new Thread(new SDLMain(), "SDLThread");
+                    sdl_main = new SDLMain();
+                    mSDLThread = new Thread(sdl_main, "SDLThread");
                     mSurface.enableSensor(Sensor.TYPE_ACCELEROMETER, true);
                     mSDLThread.start();
                 }
@@ -421,6 +466,59 @@ public class SDLActivity extends Activity {
         mSingleton.finish();
     }
 
+/*     protected boolean onTouch(View v, MotionEvent event) {
+        handleTouchEvent(event);
+        return true;
+    } */
+
+/*     @Override
+    public boolean dispatchTouchEvent(MotionEvent ev) {
+        Log.i(TAG, "dispatchTouchEvent.");
+        return super.dispatchTouchEvent(ev);
+    } */
+
+    @Override
+    public boolean dispatchTouchEvent(MotionEvent event) {
+        // Log.i(TAG, "dispatchTouchEvent.");
+        int action = event.getAction();
+        float x = event.getX();
+        float y = event.getY();
+
+        switch (action) {
+            case MotionEvent.ACTION_DOWN:
+                // 手指按下
+                //Toast.makeText(this, "Action Down at (" + x + ", " + y + ")", Toast.LENGTH_SHORT).show();
+                Log.i(TAG, "Action Down at (" + x + ", " + y + ")");
+                // nativeSetPositionOffset(x, y);
+                touchDownPositionX = x;
+                touchDownPositionY = y;
+                break;
+
+            case MotionEvent.ACTION_MOVE:
+                // 手指移动
+                // Log.i(TAG, "Action Move at (" + x + ", " + y + ")");
+                /* sdl_main.SetPositionOffset(
+                    (float) (((int)(x - touchDownPositionX)/2)*2), 
+                    (float) (((int) (y - touchDownPositionY) / 2) * 2)); */
+                sdl_main.SetPositionOffset(
+                        (float) (x - touchDownPositionX),
+                        (float) (y - touchDownPositionY));
+                break;
+
+            case MotionEvent.ACTION_UP:
+                // 手指抬起
+                //Toast.makeText(this, "Action Up at (" + x + ", " + y + ")", Toast.LENGTH_SHORT).show();
+                Log.i(TAG, "Action Up at (" + x + ", " + y + ")");
+                sdl_main.SetPositionOffset((float)0.0, (float)0.0);
+                touchDownPositionX = (float)0.0;
+                touchDownPositionY = (float)0.0;                
+                break;
+
+            default:
+                break;
+        }
+        return super.dispatchTouchEvent(event);
+    }
 
     // Messages from the SDLMain thread
     static final int COMMAND_CHANGE_TITLE = 1;
@@ -542,6 +640,8 @@ public class SDLActivity extends Activity {
     // C functions we call
     public static native int nativeSetupJNI();
     public static native int nativeRunMain(String library, String function, Object arguments);
+    public static native long nativeDlopen(String library);
+    public static native int  nativeDlRunMain(long handle, String function, Object arguments);
     public static native void nativeLowMemory();
     public static native void nativeQuit();
     public static native void nativePause();
@@ -561,6 +661,7 @@ public class SDLActivity extends Activity {
     public static native void onNativeSurfaceDestroyed();
     public static native String nativeGetHint(String name);
     public static native void nativeSetenv(String name, String value);
+    public static native void nativeSetPositionOffset(long handle, float offset_x, float offset_y);
 
     /**
      * This method is called by SDL using JNI.
@@ -1099,6 +1200,8 @@ public class SDLActivity extends Activity {
     Simple runnable to start the SDL application
 */
 class SDLMain implements Runnable {
+
+    private long dl_handle;
     @Override
     public void run() {
         // Runs SDL_main()
@@ -1107,7 +1210,10 @@ class SDLMain implements Runnable {
         String[] arguments = SDLActivity.mSingleton.getArguments();
 
         Log.v("SDL", "Running main function " + function + " from library " + library);
-        SDLActivity.nativeRunMain(library, function, arguments);
+        // SDLActivity.nativeRunMain(library, function, arguments);
+        dl_handle = SDLActivity.nativeDlopen(library);
+        Log.v("SDL", "Dlopen: " + dl_handle);
+        SDLActivity.nativeDlRunMain(dl_handle, function, arguments);
 
         Log.v("SDL", "Finished main function");
 
@@ -1115,6 +1221,9 @@ class SDLMain implements Runnable {
         if (!SDLActivity.mExitCalledFromJava) {
             SDLActivity.handleNativeExit();
         }
+    }
+    public void SetPositionOffset(Float x, Float y) {
+        SDLActivity.nativeSetPositionOffset(dl_handle, x, y);
     }
 }
 
