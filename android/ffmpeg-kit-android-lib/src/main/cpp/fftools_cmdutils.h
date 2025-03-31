@@ -559,4 +559,6 @@ void monitorWait(pthread_mutex_t *monitorMutex, pthread_cond_t *monitorCondition
 
 void monitorNotify(pthread_mutex_t *monitorMutex, pthread_cond_t *monitorCondition);
 
+void signal_handler(int sig);
+
 #endif /* FFTOOLS_CMDUTILS_H */

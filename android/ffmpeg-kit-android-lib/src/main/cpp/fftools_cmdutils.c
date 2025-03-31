@@ -74,6 +74,13 @@
 #include <errno.h>
 #include <math.h>
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <signal.h>
+#include <unistd.h>
+#include <unwind.h>
+#include <dlfcn.h>
+
 /* Include only the enabled headers since some compilers (namely, Sun
    Studio) will not omit unused inline functions and create undefined
    references to libraries that are not being built. */
@@ -1226,4 +1233,72 @@ void monitorNotify(pthread_mutex_t *monitorMutex, pthread_cond_t *monitorConditi
     pthread_mutex_lock(monitorMutex);
     pthread_cond_signal(monitorCondition);
     pthread_mutex_unlock(monitorMutex);
+}
+
+// 用于保存回溯状态的结构
+typedef struct
+{
+    void **current;
+    void **end;
+} BacktraceState;
+
+
+// 回溯的回调函数
+static _Unwind_Reason_Code unwind_callback(struct _Unwind_Context *context, void *arg)
+{
+    BacktraceState *state = (BacktraceState *)arg;
+    uintptr_t pc = _Unwind_GetIP(context); // 获取当前指令地址
+    if (pc)
+    {
+        if (state->current == state->end)
+        {
+            return _URC_END_OF_STACK;
+        }
+        else
+        {
+            *state->current++ = (void *)pc;
+        }
+    }
+    return _URC_NO_REASON;
+}
+
+// 捕获当前堆栈回溯
+size_t capture_backtrace(void **buffer, size_t max)
+{
+    BacktraceState state = {buffer, buffer + max};
+    _Unwind_Backtrace(unwind_callback, &state);
+    return state.current - buffer;
+}
+
+// 打印捕获的堆栈信息
+void print_backtrace(void **buffer, size_t count)
+{
+    for (size_t i = 0; i < count; i++)
+    {
+        const void *addr = buffer[i];
+        const char *symbol = "";
+        Dl_info info;
+
+        // 使用 dladdr 获取符号信息
+        if (dladdr(addr, &info) && info.dli_sname)
+        {
+            symbol = info.dli_sname;
+        }
+        printf("#%zu: %p %s\n", i, addr, symbol);
+        av_log(NULL, AV_LOG_ERROR, "#%zu: %p %s\n", i, addr, symbol);
+    }
+}
+
+// 信号处理函数
+void signal_handler(int sig)
+{
+    printf("Signal %d received\n", sig);
+    av_log(NULL, AV_LOG_ERROR, "Signal %d received\n", sig);
+
+    // 捕获和打印堆栈信息
+    void *buffer[30];
+    size_t count = capture_backtrace(buffer, 30);
+    print_backtrace(buffer, count);
+
+    // _Exit(1); // 退出程序
 }

@@ -9,8 +9,6 @@
 #include "ffmpegkit.h"
 // #include "ffplaykit.h"
 
-
-
 // ffplay.c  begin ====>>
 
 #include "config.h"
@@ -294,7 +292,7 @@ typedef struct VideoState
     int eof;
 
     char *filename;
-    int width, height, xleft, ytop;
+    int width, height, xleft, ytop; // xleft, ytop 猜测应该是屏幕上视频可渲染区域外的保留区域
     int step;
 
 #if CONFIG_AVFILTER
@@ -312,7 +310,68 @@ typedef struct VideoState
     int video_frame_rendered;
     int need_refresh_pos;
     float last_x, last_y;
+    int64_t last_time; // ms
+
+    // New 
+    struct VideoState *prev, *next;
+    int v_argc;
+    char* *v_argv;
+    SDL_Renderer *v_renderer;
+#define E_PLAY_STATUE_STOP 0
+#define E_PLAY_STATUE_PREPARING 1
+#define E_PLAY_STATUE_PREPARED 2
+#define E_PLAY_STATUE_PLAYING 3
+#define E_PLAY_STATUE_PAUSE 4
+    int play_status;
+
+    float current_video_xy[2]; // 当前视频的偏移坐标
+    float release_video_xy[2]; // 松手时的视频偏移坐标
+    float press_video_xy[2];   // 按下时视频的偏移坐标
+    int64_t touch_down_time;   // 手指按下的时刻
+    int64_t touch_up_time;     // 手指抬起的时刻
+
 } VideoState;
+
+typedef struct VideoGroup {
+    struct VideoState *video_state_head;
+
+} VideoGroup;
+
+typedef struct UserControl {
+	VideoState *cur_vid, *prev_vid, *next_vid;
+	int offset_x, offset_y;
+#define E_TOUCH_OFF 0x0
+#define E_TOUCH_ON 0x1
+    atomic_bool touch_state;
+#define E_SLIDE_OFF 0x0       // 未触摸屏幕
+#define E_SLIDE_FOLLOWING 0x1 // 按住，纹理坐标跟随触点
+#define E_SLIDE_BACK 0x2      // 已松开，纹理正滑到对齐屏幕
+#define E_SLIDE_SLIP_OUT 0x3  // 已松开，纹理正滑出屏幕上/下方
+    atomic_int slide_state, slide_state_last_frame;
+    /* ETouch cur_touch;
+    Enum EShowState {
+        1、已松开，纹理对齐到屏幕
+        2、按住，纹理坐标跟随offset
+        3、已松开，纹理滑到对齐屏幕
+        4、已松开，纹理滑出屏幕上/下方
+        初始状态：1；
+        状态切换：
+        1 -> 2：设置offset；
+            if(!next_vid) offset减半；
+        2 -> 3：确定轨迹公式、保存起始点，计算坐标；
+        2 -> 4：确定轨迹公式、保存起始点，计算坐标；
+        3 -> 1：销毁轨迹；
+        4 -> 1：销毁轨迹，更新cur_vid、prev_vid、next_vid，以及播放状态；
+        状态切换（!next_vid）：
+        2、
+    }*/
+} UserControl;
+
+static UserControl userControl;
+
+static struct VideoGroup* video_group = NULL;
+
+static SDL_Renderer *g_renderer;
 
 extern __thread long globalSessionId;
 
@@ -330,65 +389,65 @@ static struct CallbackData *callbackDataHead;
 static struct CallbackData *callbackDataTail;
 
 /* options specified by the user */
-static const AVInputFormat *file_iformat;
-static const char *input_filename;
-static const char *window_title;
-static int default_width = 640;
-static int default_height = 480;
+static const AVInputFormat *file_iformat; // private
+static const char *input_filename;        // private
+static const char *window_title;          // ignore
+static int default_width = 640; // global
+static int default_height = 480; // global
 static int screen_width = 0;
 static int screen_height = 0;
 static int screen_left = SDL_WINDOWPOS_CENTERED;
 static int screen_top = SDL_WINDOWPOS_CENTERED;
-static int audio_disable;
-static int video_disable;
-static int subtitle_disable;
-static const char *wanted_stream_spec[AVMEDIA_TYPE_NB] = {0};
-static int seek_by_bytes = -1;
-static float seek_interval = 10;
-static int display_disable;
-static int borderless;
-static int alwaysontop;
-static int startup_volume = 100;
-static int show_status = -1;
-static int av_sync_type = AV_SYNC_AUDIO_MASTER;
-static int64_t start_time = AV_NOPTS_VALUE;
-static int64_t duration = AV_NOPTS_VALUE;
-static int fast = 0;
+static int audio_disable; // private
+static int video_disable; // private
+static int subtitle_disable; // private
+static const char *wanted_stream_spec[AVMEDIA_TYPE_NB] = {0}; // private
+static int seek_by_bytes = -1;                                // private
+static float seek_interval = 10;                              // global
+static int display_disable;                                   // private
+static int borderless;                                        // global
+static int alwaysontop;                                       // global
+static int startup_volume = 100;                              // global
+static int show_status = -1;                                  // global
+static int av_sync_type = AV_SYNC_AUDIO_MASTER;               // global
+static int64_t start_time = AV_NOPTS_VALUE;                   // private
+static int64_t duration = AV_NOPTS_VALUE;                     // private
+static int fast = 0;                                          // private
 static int genpts = 0;
-static int lowres = 0;
-static int decoder_reorder_pts = -1;
-static int autoexit;
-static int exit_on_keydown;
-static int exit_on_mousedown;
-static int loop = 1;
-static int framedrop = -1;
-static int infinite_buffer = -1;
+static int lowres = 0; // private
+static int decoder_reorder_pts = -1; // private
+static int autoexit;                 // global
+static int exit_on_keydown;          // global
+static int exit_on_mousedown;        // global
+static int loop = 1;                 // global
+static int framedrop = -1;           // global
+static int infinite_buffer = -1;     // global
 static enum ShowMode show_mode = SHOW_MODE_NONE;
-static const char *audio_codec_name;
-static const char *subtitle_codec_name;
-static const char *video_codec_name;
-double rdftspeed = 0.02;
-static int64_t cursor_last_shown;
-static int cursor_hidden = 0;
+static const char *audio_codec_name;    // private
+static const char *subtitle_codec_name; // private
+static const char *video_codec_name;    // private
+double rdftspeed = 0.02;                // private
+static int64_t cursor_last_shown;       // global
+static int cursor_hidden = 0;           // global
 #if CONFIG_AVFILTER
 static const char **vfilters_list = NULL;
 static int nb_vfilters = 0;
 static char *afilters = NULL;
 #endif
-static int autorotate = 1;
-static int ffplay_find_stream_info = 1;
-static int filter_nbthreads = 0;
+static int autorotate = 1; // global
+static int ffplay_find_stream_info = 1; // global
+static int filter_nbthreads = 0;        // private
 
 /* current context */
-static int is_full_screen;
-static int64_t audio_callback_time;
+static int is_full_screen; // global
+static int64_t audio_callback_time; // private
 
 #define FF_QUIT_EVENT (SDL_USEREVENT + 2)
 
-static SDL_Window *window;
-static SDL_Renderer *renderer;
-static SDL_RendererInfo renderer_info = {0};
-static SDL_AudioDeviceID audio_dev;
+static SDL_Window *window; // global
+// static SDL_Renderer *renderer; // private
+static SDL_RendererInfo renderer_info = {0}; // private
+static SDL_AudioDeviceID audio_dev;          // private
 
 static const struct TextureFormatEntry
 {
@@ -415,10 +474,136 @@ static const struct TextureFormatEntry
     {AV_PIX_FMT_YUYV422, SDL_PIXELFORMAT_YUY2},
     {AV_PIX_FMT_UYVY422, SDL_PIXELFORMAT_UYVY},
     {AV_PIX_FMT_NONE, SDL_PIXELFORMAT_UNKNOWN},
-};
+}; // global
 
-static float render_position_offset[2];
+static atomic_int touch_on = 0;
+static atomic_int touch_on_last = 0;
+static _Atomic float touch_down_xy[2] = {0.0, 0.0}; // 手指按下时的坐标
+static _Atomic float touch_move_xy[2] = {0.0, 0.0}; // 手指实时的坐标
+static _Atomic float touch_up_xy[2] = {0.0, 0.0}; // 手指抬起时的坐标
+// static float accumulate_move_xy[2] = {0.0, 0.0};
+// static float last_frame_xy[2] = {0.0, 0.0};    // 上一帧的偏移坐标
+// static atomic_int rect_offset_x, rect_offset_y; // 用户滑动时视频实际偏移
+#define LONG_DISTANCE 1200
+#define SHORT_DISTANCE 150
+#define THRESHOLD_TIME 150
 
+
+/**
+ * 速度平滑运动算法
+ * @param step_time 上一次渲染到本次的毫秒数
+ * @param lastX     上一次渲染X坐标
+ * @param lastY     上一次渲染Y坐标
+ * @param startX  起点X坐标
+ * @param startY  起点Y坐标
+ * @param endX    终点X坐标
+ * @param endY    终点Y坐标
+ * @param accelDist     加速的范围，占整体距离的比例 (0 ~ 0.5)
+ * @param decelDist     减速的范围，占整体距离的比例 (0 ~ 0.5)
+ * @param currentX      本次的目标X坐标
+ * @param currentY      本次的目标Y坐标
+ */
+static void
+speedSmoothMove(float step_time, float lastX, float lastY, float startX, float startY, float endX, float endY,
+                float accelDist, float decelDist, float *currentX, float *currentY)
+{
+    if (fabsf(lastX - endX) <= 1.0 && fabsf(lastY - endY) <= 1.0)
+    {
+        *currentX = endX;
+        *currentY = endY;
+        av_log(NULL, AV_LOG_INFO, "speedSmoothMove. Too nearby. Return\n");
+        return;
+    }
+    // 计算运动距离
+    float totalX = endX - startX;
+    float totalY = endY - startY;
+    float passedX = lastX - startX;
+    float passedY = lastY - startY;
+
+    if (totalX == 0.0 && totalY == 0.0)
+    {
+        *currentX = endX;
+        *currentY = endY;
+        return;
+    }/* 
+    if (fabsf(passedX) > fabsf(totalX) || fabsf(passedY) > fabsf(totalY))
+    {
+        *currentX = endX;
+        *currentY = endY;
+        return;
+    } */
+    if (accelDist <= 0.0 || accelDist >= 0.5)
+    {
+        accelDist = 0.1;
+    }
+    if (decelDist <= 0.0 || decelDist >= 0.5)
+    {
+        decelDist = 0.1;
+    }
+    // 距离比例 (0 ~ 1)
+    float progress = sqrt(pow(passedX, 2) + pow(passedY, 2)) / sqrt(pow(totalX, 2) + pow(totalY, 2));
+    if (progress >= 1.0) {
+        *currentX = endX;
+        *currentY = endY;
+        return;
+    }
+    // 确定最高速度（每毫秒运动的像素数），粗略预计在200ms多完成。
+    float max_speed_x = totalX / 200, max_speed_y = totalY / 200;
+    // av_log(NULL, AV_LOG_INFO, "speedSmoothMove. max speed: [%f, %f]\n", max_speed_x, max_speed_y);
+    // 当前应有的速度
+    float current_speed_x = 0.0, current_speed_y = 0.0;
+    if (progress < accelDist) {
+        if (totalX)
+            current_speed_x = max_speed_x * (passedX / (accelDist * totalX));
+        if (totalY)
+            current_speed_y = max_speed_y * (passedY / (accelDist * totalY));
+        // 避免一开始速度过慢或为0的情况。
+        if (fabsf(current_speed_x) < fabsf(max_speed_x) / 10)
+            current_speed_x = max_speed_x / 10;
+        if (fabsf(current_speed_y) < fabsf(max_speed_y) / 10)
+            current_speed_y = max_speed_y / 10;
+        // av_log(NULL, AV_LOG_INFO, "speedSmoothMove. accelDist, current speed: [%f, %f]\n", current_speed_x, current_speed_y);
+    } else if ((progress <= 1.0 - decelDist)) {
+        current_speed_x = max_speed_x;
+        current_speed_y = max_speed_y;
+        // av_log(NULL, AV_LOG_INFO, "speedSmoothMove. Middle dist, current speed: [%f, %f]\n", current_speed_x, current_speed_y);
+    } else {
+        if (totalX)
+            current_speed_x = max_speed_x * ((totalX - passedX) / (decelDist * totalX));
+        if (totalY)
+            current_speed_y = max_speed_y * ((totalY - passedY) / (decelDist * totalY));
+        if (fabsf(current_speed_x) < fabsf(max_speed_x) / 10)
+            current_speed_x = max_speed_x / 10;
+        if (fabsf(current_speed_y) < fabsf(max_speed_y) / 10)
+            current_speed_y = max_speed_y / 10;
+        // av_log(NULL, AV_LOG_INFO, "speedSmoothMove. decelDist, current speed: [%f, %f]\n", current_speed_x, current_speed_y);
+    }
+    // 不让滑过头
+    if (fabsf(current_speed_x * step_time) > fabsf(lastX - endX))
+        *currentX = endX;
+    else 
+        *currentX = lastX + current_speed_x * step_time;
+    if (fabsf(current_speed_y * step_time) > fabsf(lastY - endY))
+        *currentY = endY;
+    else
+        *currentY = lastY + current_speed_y * step_time;
+    return;
+}
+
+static void speedUpMoveOut(float step_time, float lastX, float lastY, float startX, float startY, float endX, float endY,
+                            float accelFactor, float *currentX, float *currentY)
+{
+    float avg_speed_x = (endX - startX) / 200, avg_speed_y = (endY - startY) / 200;
+    if (fabsf(step_time * avg_speed_x) > fabsf(lastX - endX))
+        *currentX = endX;
+    else
+        *currentX = lastX + step_time * avg_speed_x;
+    if (fabsf(step_time * avg_speed_y) > fabsf(lastY - endY))
+        *currentY = endY;
+    else
+        *currentY = lastY + step_time * avg_speed_y;
+    return;
+}
 
 /**
  * Adds log data to the end of callback data list.
@@ -532,6 +717,40 @@ static inline int cmp_audio_fmts(enum AVSampleFormat fmt1, int64_t channel_count
     else
         return channel_count1 != channel_count2 || fmt1 != fmt2;
 }
+
+static void group_push_back(VideoGroup* vg, VideoState* vs)
+{
+    VideoState* v = vg->video_state_head;
+    if (!v)
+    {
+        vg->video_state_head = vs;
+        return;
+    }
+    while (v->next)
+    {
+        v = v->next;
+    }
+    v->next = vs;
+    vs->next = NULL;
+    return;
+}
+
+static VideoState* group_front(VideoGroup* vg)
+{
+    return vg->video_state_head;
+}
+
+/* static void group_pop(VideoGroup* vg)
+{
+    VideoState* head = vg->video_state_head;
+    if (head)
+    {
+        VideoState* second = head->next;
+        // av_free(head);
+        vg->video_state_head = second;
+    }
+    return ;
+} */
 
 static int packet_queue_put_private(PacketQueue *q, AVPacket *pkt)
 {
@@ -978,7 +1197,7 @@ static void decoder_abort(Decoder *d, FrameQueue *fq)
     packet_queue_flush(d->queue);
 }
 
-static inline void fill_rectangle(int x, int y, int w, int h)
+static inline void fill_rectangle(SDL_Renderer *renderer, int x, int y, int w, int h)
 {
     SDL_Rect rect;
     rect.x = x;
@@ -989,7 +1208,7 @@ static inline void fill_rectangle(int x, int y, int w, int h)
         SDL_RenderFillRect(renderer, &rect);
 }
 
-static int realloc_texture(SDL_Texture **texture, Uint32 new_format, int new_width, int new_height, SDL_BlendMode blendmode, int init_texture)
+static int realloc_texture(SDL_Renderer *renderer, SDL_Texture **texture, Uint32 new_format, int new_width, int new_height, SDL_BlendMode blendmode, int init_texture)
 {
     Uint32 format;
     int access, w, h;
@@ -1014,17 +1233,28 @@ static int realloc_texture(SDL_Texture **texture, Uint32 new_format, int new_wid
     }
     return 0;
 }
-
+/*
+    功能 - 计算视频最终在屏幕中显示的区域 x,y,w,h 基于屏幕分辨率
+    rect -       最终视频在屏幕显示的区域
+    scr_xleft -  基于屏幕分辨率，视频在屏幕允许显示区域左上角x坐标
+    scr_ytop -   基于屏幕分辨率，视频在屏幕允许显示区域左上角y坐标
+    scr_width -  基于屏幕分辨率，视频在屏幕允许显示区域高
+    scr_height - 基于屏幕分辨率，视频在屏幕允许显示区域宽
+    pic_width -  视频像素高
+    pic_height - 视频像素宽
+    pic_sar -    视频像素宽高比（采样宽高比）
+*/
 static void calculate_display_rect(SDL_Rect *rect,
                                    int scr_xleft, int scr_ytop, int scr_width, int scr_height,
                                    int pic_width, int pic_height, AVRational pic_sar)
 {
     AVRational aspect_ratio = pic_sar;
-    int64_t width, height, x, y;
+    int64_t width, height, x, y;  //视频在屏幕上的宽高与坐标，单位应该是屏幕像素个数
 
     if (av_cmp_q(aspect_ratio, av_make_q(0, 1)) <= 0)
         aspect_ratio = av_make_q(1, 1);
 
+    // 显示宽高比
     aspect_ratio = av_mul_q(aspect_ratio, av_make_q(pic_width, pic_height));
 
     /* XXX: we suppose the screen has a 1.0 pixel ratio */
@@ -1037,6 +1267,7 @@ static void calculate_display_rect(SDL_Rect *rect,
     }
     x = (scr_width - width) / 2;
     y = (scr_height - height) / 2;
+    // rect得到的是以屏幕像素为单位的坐标范围。
     rect->x = scr_xleft + x;
     rect->y = scr_ytop + y;
     rect->w = FFMAX((int)width, 1);
@@ -1063,13 +1294,13 @@ static void get_sdl_pix_fmt_and_blendmode(int format, Uint32 *sdl_pix_fmt, SDL_B
     }
 }
 
-static int upload_texture(SDL_Texture **tex, AVFrame *frame, struct SwsContext **img_convert_ctx)
+static int upload_texture(SDL_Renderer *renderer, SDL_Texture **tex, AVFrame *frame, struct SwsContext **img_convert_ctx)
 {
     int ret = 0;
     Uint32 sdl_pix_fmt;
     SDL_BlendMode sdl_blendmode;
     get_sdl_pix_fmt_and_blendmode(frame->format, &sdl_pix_fmt, &sdl_blendmode);
-    if (realloc_texture(tex, sdl_pix_fmt == SDL_PIXELFORMAT_UNKNOWN ? SDL_PIXELFORMAT_ARGB8888 : sdl_pix_fmt, frame->width, frame->height, sdl_blendmode, 0) < 0)
+    if (realloc_texture(renderer, tex, sdl_pix_fmt == SDL_PIXELFORMAT_UNKNOWN ? SDL_PIXELFORMAT_ARGB8888 : sdl_pix_fmt, frame->width, frame->height, sdl_blendmode, 0) < 0)
         return -1;
     switch (sdl_pix_fmt)
     {
@@ -1170,7 +1401,7 @@ static void video_image_display(VideoState *is)
                         sp->width = vp->width;
                         sp->height = vp->height;
                     }
-                    if (realloc_texture(&is->sub_texture, SDL_PIXELFORMAT_ARGB8888, sp->width, sp->height, SDL_BLENDMODE_BLEND, 1) < 0)
+                    if (realloc_texture(g_renderer, &is->sub_texture, SDL_PIXELFORMAT_ARGB8888, sp->width, sp->height, SDL_BLENDMODE_BLEND, 1) < 0)
                         return;
 
                     for (i = 0; i < sp->sub.num_rects; i++)
@@ -1207,11 +1438,14 @@ static void video_image_display(VideoState *is)
     }
 
     calculate_display_rect(&rect, is->xleft, is->ytop, is->width, is->height, vp->width, vp->height, vp->sar);
+    rect.x += is->current_video_xy[0];
+    rect.y += is->current_video_xy[1];
     set_sdl_yuv_conversion_mode(vp->frame);
 
     if (!vp->uploaded)
     {
-        if (upload_texture(&is->vid_texture, vp->frame, &is->img_convert_ctx) < 0)
+        // 将frame数据填充进纹理
+        if (upload_texture(g_renderer, &is->vid_texture, vp->frame, &is->img_convert_ctx) < 0)
         {
             set_sdl_yuv_conversion_mode(NULL);
             return;
@@ -1219,16 +1453,17 @@ static void video_image_display(VideoState *is)
         vp->uploaded = 1;
         vp->flip_v = vp->frame->linesize[0] < 0;
     }
-    av_log(NULL, AV_LOG_INFO, "render in video_image_display. %d\n", is->video_frame_rendered);
+    // av_log(NULL, AV_LOG_INFO, "render in video_image_display. %d\n", is->video_frame_rendered);
     static double angle = 0.0;
-    SDL_RenderCopyEx(renderer, is->vid_texture, NULL, &rect, angle, NULL, vp->flip_v ? SDL_FLIP_VERTICAL : 0);
+    // 渲染一帧
+    SDL_RenderCopyEx(g_renderer, is->vid_texture, NULL, &rect, angle, NULL, vp->flip_v ? SDL_FLIP_VERTICAL : 0);
     // angle += 1.0;
     is->video_frame_rendered++;
     set_sdl_yuv_conversion_mode(NULL);
     if (sp)
     {
 #if USE_ONEPASS_SUBTITLE_RENDER
-        SDL_RenderCopy(renderer, is->sub_texture, NULL, &rect);
+        SDL_RenderCopy(g_renderer, is->sub_texture, NULL, &rect);
 #else
         int i;
         double xratio = (double)rect.w / (double)sp->width;
@@ -1240,10 +1475,18 @@ static void video_image_display(VideoState *is)
                                .y = rect.y + sub_rect->y * yratio,
                                .w = sub_rect->w * xratio,
                                .h = sub_rect->h * yratio};
-            SDL_RenderCopy(renderer, is->sub_texture, sub_rect, &target);
+            SDL_RenderCopy(g_renderer, is->sub_texture, sub_rect, &target);
         }
 #endif
     }
+    // 修正因上一个视频改过的坐标偏移。
+    // 放在这里合适吗？
+    /* if (1 == is->video_frame_rendered) {
+        SDL_SetVertexPositionOffset(g_renderer,
+                            is->last_x = 0.0,
+                            is->last_y = 0.0);
+
+    } */
 }
 
 static inline int compute_mod(int a, int b)
@@ -1313,7 +1556,7 @@ static void video_audio_display(VideoState *s)
 
     if (s->show_mode == SHOW_MODE_WAVES)
     {
-        SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+        SDL_SetRenderDrawColor(g_renderer, 255, 255, 255, 255);
 
         /* total height for one channel */
         h = s->height / nb_display_channels;
@@ -1335,24 +1578,24 @@ static void video_audio_display(VideoState *s)
                 {
                     ys = y1;
                 }
-                fill_rectangle(s->xleft + x, ys, 1, y);
+                fill_rectangle(g_renderer, s->xleft + x, ys, 1, y);
                 i += channels;
                 if (i >= SAMPLE_ARRAY_SIZE)
                     i -= SAMPLE_ARRAY_SIZE;
             }
         }
 
-        SDL_SetRenderDrawColor(renderer, 0, 0, 255, 255);
+        SDL_SetRenderDrawColor(g_renderer, 0, 0, 255, 255);
 
         for (ch = 1; ch < nb_display_channels; ch++)
         {
             y = s->ytop + ch * h;
-            fill_rectangle(s->xleft, y, s->width, 1);
+            fill_rectangle(g_renderer, s->xleft, y, s->width, 1);
         }
     }
     else
     {
-        if (realloc_texture(&s->vis_texture, SDL_PIXELFORMAT_ARGB8888, s->width, s->height, SDL_BLENDMODE_NONE, 1) < 0)
+        if (realloc_texture(g_renderer, &s->vis_texture, SDL_PIXELFORMAT_ARGB8888, s->width, s->height, SDL_BLENDMODE_NONE, 1) < 0)
             return;
 
         if (s->xpos >= s->width)
@@ -1410,7 +1653,7 @@ static void video_audio_display(VideoState *s)
                 }
                 SDL_UnlockTexture(s->vis_texture);
             }
-            SDL_RenderCopy(renderer, s->vis_texture, NULL, NULL);
+            SDL_RenderCopy(g_renderer, s->vis_texture, NULL, NULL);
         }
         if (!s->paused)
             s->xpos++;
@@ -1520,8 +1763,8 @@ static void do_exit(VideoState *is)
     {
         stream_close(is);
     }
-    if (renderer)
-        SDL_DestroyRenderer(renderer);
+    if (g_renderer)
+        SDL_DestroyRenderer(g_renderer);
     if (window)
         SDL_DestroyWindow(window);
     uninit_opts();
@@ -1557,13 +1800,13 @@ static int video_open(VideoState *is)
 {
     int w, h;
 
+    av_log(NULL, AV_LOG_INFO, "Screen w, h: [%d, %d]\n", screen_width, screen_height);
     w = screen_width ? screen_width : default_width;
     h = screen_height ? screen_height : default_height;
 
     if (!window_title)
         window_title = input_filename;
     SDL_SetWindowTitle(window, window_title);
-
     SDL_SetWindowSize(window, w, h);
     SDL_SetWindowPosition(window, screen_left, screen_top);
     if (is_full_screen)
@@ -1582,13 +1825,13 @@ static void video_display(VideoState *is)
     if (!is->width)
         video_open(is);
 
-    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
-    SDL_RenderClear(renderer);
+    SDL_SetRenderDrawColor(g_renderer, 0, 0, 0, 255);
+    SDL_RenderClear(g_renderer);
     if (is->audio_st && is->show_mode != SHOW_MODE_VIDEO)
         video_audio_display(is);
     else if (is->video_st)
         video_image_display(is);
-    SDL_RenderPresent(renderer);
+    SDL_RenderPresent(g_renderer);
 }
 
 static double get_clock(Clock *c)
@@ -1945,8 +2188,9 @@ static void video_refresh(void *opaque, double *remaining_time)
         }
     display:
         /* display picture */
-        if (!display_disable && is->force_refresh && is->show_mode == SHOW_MODE_VIDEO && is->pictq.rindex_shown)
+        if (!display_disable && is->force_refresh && is->show_mode == SHOW_MODE_VIDEO && is->pictq.rindex_shown) {
             video_display(is);
+        }
     }
     is->force_refresh = 0;
     if (show_status && 0)
@@ -3022,7 +3266,6 @@ static int stream_component_open(VideoState *is, int stream_index)
         if (ret < 0)
             goto fail;
 #endif
-
         /* prepare audio output */
         if ((ret = audio_open(is, &ch_layout, sample_rate, &is->audio_tgt)) < 0)
             goto fail;
@@ -3035,7 +3278,7 @@ static int stream_component_open(VideoState *is, int stream_index)
         is->audio_diff_avg_coef = exp(log(0.01) / AUDIO_DIFF_AVG_NB);
         is->audio_diff_avg_count = 0;
         /* since we do not have a precise anough audio FIFO fullness,
-           we correct audio sync only if larger than this threshold */
+            we correct audio sync only if larger than this threshold */
         is->audio_diff_threshold = (double)(is->audio_hw_buf_size) / is->audio_tgt.bytes_per_sec;
 
         is->audio_stream = stream_index;
@@ -3050,7 +3293,7 @@ static int stream_component_open(VideoState *is, int stream_index)
         }
         if ((ret = decoder_start(&is->auddec, audio_thread, "audio_decoder", is)) < 0)
             goto out;
-        SDL_PauseAudioDevice(audio_dev, 0);
+        SDL_PauseAudioDevice(audio_dev, 0);  // OpenAudioDevice 默认是 Pause 状态的，这里 resume
         break;
     case AVMEDIA_TYPE_VIDEO:
         is->video_stream = stream_index;
@@ -3481,27 +3724,34 @@ fail:
     return 0;
 }
 
-static VideoState *stream_open(const char *filename,
-                               const AVInputFormat *iformat)
+static VideoState *create_video_state()
 {
     VideoState *is;
-
     is = av_mallocz(sizeof(VideoState));
+    return is;
+}
+
+static int stream_open(VideoState *is /*, const char *filename , const AVInputFormat *iformat */)
+{
+    //VideoState *is;
+
+    //is = av_mallocz(sizeof(VideoState));
     if (!is)
-        return NULL;
+        return -1;
     is->last_video_stream = is->video_stream = -1;
     is->last_audio_stream = is->audio_stream = -1;
     is->last_subtitle_stream = is->subtitle_stream = -1;
-    is->filename = av_strdup(filename);
-    if (!is->filename)
-        goto fail;
-    is->iformat = iformat;
+    // is->filename = av_strdup(filename);
+    // if (!is->filename)
+        //goto fail;
+    // is->iformat = iformat;
     is->ytop = 0;
     is->xleft = 0;
     is->video_frame_rendered = 0;
     is->need_refresh_pos = 0;
     is->last_x = 0.0;
     is->last_y = 0.0;
+    is->last_time = 0;
 
     /* start video display */
     if (frame_queue_init(&is->pictq, &is->videoq, VIDEO_PICTURE_QUEUE_SIZE, 1) < 0)
@@ -3541,9 +3791,9 @@ static VideoState *stream_open(const char *filename,
         av_log(NULL, AV_LOG_FATAL, "SDL_CreateThread(): %s\n", SDL_GetError());
     fail:
         stream_close(is);
-        return NULL;
+        return -2;
     }
-    return is;
+    return 0;
 }
 
 static void stream_cycle_channel(VideoState *is, int codec_type)
@@ -3669,24 +3919,170 @@ static void refresh_loop_wait_event(VideoState *is, SDL_Event *event)
             av_usleep((int64_t)(remaining_time * 1000000.0));
         remaining_time = REFRESH_RATE;
 
-        if ((render_position_offset[0] != 0.0 || render_position_offset[1] != 0.0) || (render_position_offset[0] == 0.0 && render_position_offset[1] == 0.0 && (is->last_x != 0.0 || is->last_y != 0.0)))
+        // if (!is->video_frame_rendered)
+
+        int is_on_now = atomic_load(&touch_on);
+        int is_on_last = atomic_load(&touch_on_last);
+        /* if ((touch_move_xy[0] != 0.0 || touch_move_xy[1] != 0.0) || (touch_move_xy[0] == 0.0 && touch_move_xy[1] == 0.0 && (is->last_x != 0.0 || is->last_y != 0.0))) */
+        int s;
+        if ((E_SLIDE_OFF != (s = atomic_load(&userControl.slide_state))) || !(!is_on_last && !is_on_now))
         {
             is->need_refresh_pos = 1;
             is->force_refresh = 1;
         }
         else
             is->need_refresh_pos = 0;
+
         if (is->show_mode != SHOW_MODE_NONE && (!is->paused || is->force_refresh)) {
-            if (!display_disable && renderer && /* is->video_frame_rendered > 0 && */ is->need_refresh_pos)
+            if (!display_disable && g_renderer && /* is->video_frame_rendered > 0 && */ is->need_refresh_pos)
             {
-                av_log(NULL, AV_LOG_INFO, "Call SDL_SetVertexPositionOffset in refresh loop: [%f, %f]\n",
-                       render_position_offset[0], render_position_offset[1]);
-                SDL_SetVertexPositionOffset(renderer,
-                                            is->last_x = render_position_offset[0],
-                                            is->last_y = render_position_offset[1]);
+                if (E_SLIDE_OFF == s &&  (!is_on_last && is_on_now)){
+                    // OFF状态按下
+                    is->touch_down_time = av_gettime();
+                    atomic_store(&userControl.slide_state_last_frame, s);
+                    atomic_store(&userControl.slide_state, E_SLIDE_FOLLOWING);
+                    atomic_store(&touch_on_last, is_on_now);
+                } else if (E_SLIDE_FOLLOWING == s && (is_on_last && is_on_now)) {
+                    // 持续被按下
+                    float down_x[2] = {atomic_load(&touch_down_xy[0]), atomic_load(&touch_down_xy[1])},
+                          move_xy[2] = {atomic_load(&touch_move_xy[0]), atomic_load(&touch_move_xy[1])};
+                    is->current_video_xy[0] = is->last_x = move_xy[0] - down_x[0] + is->press_video_xy[0];
+                    is->current_video_xy[1] = is->last_y = move_xy[1] - down_x[1] + is->press_video_xy[1];
+                    av_log(NULL, AV_LOG_INFO, "E_SLIDE_FOLLOWING. touch_move_xy: [%f, %f], touch_down_xy: [%f, %f], is->press_video_xy: [%f, %f]\n",
+                           move_xy[0], move_xy[1], down_x[0], down_x[1], is->press_video_xy[0], is->press_video_xy[1]);
+                    av_log(NULL, AV_LOG_INFO, "E_SLIDE_FOLLOWING. current_x: %f, current_y: %f\n", is->current_video_xy[0], is->current_video_xy[1]);
+                } else if (E_SLIDE_FOLLOWING == s && (is_on_last && !is_on_now)) {
+                    // 松开
+                    is->touch_up_time = av_gettime();
+                    // 记录松开时视频的坐标
+                    is->release_video_xy[0] = is->current_video_xy[0];
+                    is->release_video_xy[1] = is->current_video_xy[1];
+                    // 计算本次视频滑动的距离
+                    // float distance = sqrt(pow(is->press_video_xy[0] - is->release_video_xy[0], 2.0) + pow(is->press_video_xy[1] - is->release_video_xy[1], 2.0));
+                    float distance = sqrt(pow(is->release_video_xy[0], 2.0) + pow(is->release_video_xy[1], 2.0));
+                    // 计算本次视频滑动持续时间
+                    int64_t slip_time = (is->touch_up_time - is->touch_down_time) / 1000; // ms
+
+                    /* short distance || medium distance and long time*/
+                    if (distance >= LONG_DISTANCE 
+                        || (E_SLIDE_OFF == atomic_load(&userControl.slide_state_last_frame) 
+                        && distance >= SHORT_DISTANCE && distance <= LONG_DISTANCE && slip_time <= THRESHOLD_TIME) ){
+                        atomic_store(&userControl.slide_state_last_frame, s);
+                        atomic_store(&userControl.slide_state, E_SLIDE_SLIP_OUT);
+                    }
+                    else{
+                        atomic_store(&userControl.slide_state_last_frame, s);                        
+                        atomic_store(&userControl.slide_state, E_SLIDE_BACK);
+                    }
+                    is->last_time = is->touch_up_time;
+                    atomic_store(&touch_on_last, is_on_now);
+                }
+                else if (E_SLIDE_BACK == s)
+                {
+                    int64_t this_time = av_gettime();
+                    /* 未完成时按下 */
+                    if (!is_on_last && is_on_now )
+                    {
+                        is->touch_down_time = this_time;
+                        is->press_video_xy[0] = is->current_video_xy[0];
+                        is->press_video_xy[1] = is->current_video_xy[1];
+                        av_log(NULL, AV_LOG_INFO, "when E_SLIDE_BACK, touch on. is->press_video_xy: [%f, %f]", is->press_video_xy[0], is->press_video_xy[1]);
+                        atomic_store(&userControl.slide_state_last_frame, s);
+                        atomic_store(&userControl.slide_state, E_SLIDE_FOLLOWING);
+                        atomic_store(&touch_on_last, is_on_now);
+                    }
+                    else 
+                    {
+                        float diff_time;
+                        if (is->last_time != 0)
+                            diff_time = (float)(this_time - is->last_time) / 1000;
+                        else
+                            diff_time = 25.0;
+                        // float current_x, current_y;
+                        speedSmoothMove(diff_time, is->last_x, is->last_y,
+                                        (float)is->release_video_xy[0], (float)is->release_video_xy[1],
+                                        0.0, 0.0,
+                                        0.2, 0.2,
+                                        &is->current_video_xy[0], &is->current_video_xy[1]);
+                        av_log(NULL, AV_LOG_INFO, "E_SLIDE_BACK. diff_time: %f, current_x: %f, current_y: %f\n",
+                               diff_time,
+                               is->current_video_xy[0], is->current_video_xy[1]);
+                        /* SDL_SetVertexPositionOffset(g_renderer,
+                                                    is->last_x = current_x,
+                                                    is->last_y = current_y); */
+                        // atomic_store(&rect_offset_x, is->last_x = current_x);
+                        // atomic_store(&rect_offset_y, is->last_y = current_y);
+                        is->last_x = is->current_video_xy[0];
+                        is->last_y = is->current_video_xy[1];
+                        is->last_time = this_time;
+                        if (0.0 == is->current_video_xy[0] && 0.0 == is->current_video_xy[1]) {
+                            is->press_video_xy[0] = 0.0;
+                            is->press_video_xy[1] = 0.0;
+                            atomic_store(&userControl.slide_state_last_frame, s);
+                            atomic_store(&userControl.slide_state, E_SLIDE_OFF);
+                        }
+                        atomic_store(&touch_on_last, is_on_now);
+                    }
+                }
+                else if (E_SLIDE_SLIP_OUT == s)
+                {
+                    int64_t this_time = av_gettime();
+                    /* 未完成时按下 */
+                    if (!is_on_last && is_on_now)
+                    {
+                        is->touch_down_time = this_time;
+                        is->press_video_xy[0] = is->current_video_xy[0];
+                        is->press_video_xy[1] = is->current_video_xy[1];
+                        av_log(NULL, AV_LOG_INFO, "when E_SLIDE_SLIP_OUT, touch on. is->press_video_xy: [%f, %f]", is->press_video_xy[0], is->press_video_xy[1]);
+                        atomic_store(&userControl.slide_state_last_frame, s);
+                        atomic_store(&userControl.slide_state, E_SLIDE_FOLLOWING);
+                        atomic_store(&touch_on_last, is_on_now);
+                    } else{
+                        float diff_time;
+                        diff_time = (float)(this_time - is->last_time) / 1000;
+                        float target_x = 0.0, target_y = -2000.0;
+                        // float current_x, current_y;
+                        speedUpMoveOut(diff_time,
+                                       is->last_x, is->last_y,
+                                       (float)is->release_video_xy[0], (float)is->release_video_xy[1],
+                                       target_x, target_y,
+                                       1.0, &is->current_video_xy[0], &is->current_video_xy[1]);
+                        av_log(NULL, AV_LOG_INFO, "E_SLIDE_SLIP_OUT. diff_time: %f, current_x: %f, current_y: %f\n",
+                               diff_time,
+                               is->current_video_xy[0], is->current_video_xy[1]);
+                        /* SDL_SetVertexPositionOffset(g_renderer,
+                                                    is->last_x = current_x,
+                                                    is->last_y = current_y); */
+                        // atomic_store(&rect_offset_x, is->last_x = current_x);
+                        // atomic_store(&rect_offset_y, is->last_y = current_y);
+                        is->last_x = is->current_video_xy[0];
+                        is->last_y = is->current_video_xy[1];
+                        is->last_time = this_time;
+                        if (target_x == is->current_video_xy[0] && target_y == is->current_video_xy[1])
+                        {
+                            atomic_store(&userControl.slide_state_last_frame, s);
+                            atomic_store(&userControl.slide_state, E_SLIDE_OFF);
+                            atomic_store(&touch_down_xy[0], 0.0);
+                            atomic_store(&touch_down_xy[1], 0.0);
+                            atomic_store(&touch_move_xy[0], 0.0);
+                            atomic_store(&touch_move_xy[1], 0.0);
+                            atomic_store(&touch_up_xy[0], 0.0);
+                            atomic_store(&touch_up_xy[1], 0.0);
+                            is->press_video_xy[0] = 0.0;
+                            is->press_video_xy[1] = 0.0;
+
+                            SDL_Event event;
+                            event.type = FF_QUIT_EVENT;
+                            event.user.data1 = is;
+                            SDL_PushEvent(&event);
+                        }
+                    }
+                }
             }
+
             video_refresh(is, &remaining_time);
         }
+        atomic_store(&touch_on_last, is_on_now);
         SDL_PumpEvents();
     }
 }
@@ -3937,19 +4333,35 @@ static void event_loop(VideoState *cur_stream)
             }
             break;
         case SDL_QUIT:
+            // liuzhi. SDL and activity both quit.
+            do_exit(cur_stream);
+            break;
         case FF_QUIT_EVENT:
+            // Just ffplay quits current play.
+            av_log(NULL, AV_LOG_INFO, "FF_QUIT_EVENT, not call do_exit, and return.\n");
+            atomic_store(&touch_on, 0);
+            atomic_store(&touch_on_last,0);
+            atomic_store(&userControl.touch_state, true);
+            atomic_store(&userControl.slide_state, E_SLIDE_OFF);
+            atomic_store(&userControl.slide_state_last_frame, E_SLIDE_OFF);
+            // atomic_store(&rect_offset_x, 0);
+            // atomic_store(&rect_offset_y, 0);
+            cur_stream->current_video_xy[0] = 0.0;
+            cur_stream->current_video_xy[1] = 0.0;
+            return ;
             do_exit(cur_stream);
             break;
         default:
             break;
         }
         // liuzhi. Thread should quit.
-        if (cur_stream->eof)
+        /* if (cur_stream->eof)
         {
             do_exit(cur_stream);
             break;
-        }
+        } */
     }
+    av_log(NULL, AV_LOG_INFO, "End of event_loop\n");
 }
 
 static int opt_width(void *optctx, const char *opt, const char *arg)
@@ -4015,10 +4427,13 @@ static void opt_input_file(void *optctx, const char *filename)
 {
     if (input_filename)
     {
-        av_log(NULL, AV_LOG_FATAL,
+/*         av_log(NULL, AV_LOG_FATAL,
                "Argument '%s' provided as input filename, but '%s' was already specified.\n",
                filename, input_filename);
-        exit(1);
+        exit(1); */
+        av_log(NULL, AV_LOG_INFO, "Free input_filename");
+        av_free((void*)input_filename);
+        input_filename = NULL;
     }
     if (!strcmp(filename, "-"))
         filename = "fd:";
@@ -4151,44 +4566,42 @@ void show_help_default(const char *opt, const char *arg)
            "left double-click   toggle full screen\n");
 }
 
-/* Called from the main */
-// 20241128 ffplay_main 
-int main(int argc, char **argv)
+SDL_Renderer *create_renderer(SDL_Window *window) 
 {
+    SDL_Renderer *renderer;
+    if (window)
+    {
+        renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+        if (!renderer)
+        {
+            av_log(NULL, AV_LOG_WARNING, "Failed to initialize a hardware accelerated renderer: %s\n", SDL_GetError());
+            renderer = SDL_CreateRenderer(window, -1, 0);
+        }
+        if (renderer)
+        {
+            if (!SDL_GetRendererInfo(renderer, &renderer_info))
+                av_log(NULL, AV_LOG_VERBOSE, "Initialized %s renderer.\n", renderer_info.name);
+        }
+    }
+    if (!window || !renderer || !renderer_info.num_texture_formats)
+    {
+        av_log(NULL, AV_LOG_FATAL, "Failed to create window or renderer: %s", SDL_GetError());
+        // do_exit(NULL);
+        return NULL;
+    }
+    return renderer;
+}
+void destroy_renderer(SDL_Renderer *renderer)
+{
+    if (renderer)
+        SDL_DestroyRenderer(renderer);
+    return ;
+}
+
+void SDLSetting() {
     int flags, ret;
-    VideoState *is;
 
-    init_dynload();
-
-    av_log_set_flags(AV_LOG_SKIP_REPEATED);
-    parse_loglevel(argc, argv, options);
-
-    /* register all codecs, demux and protocols */
-#if CONFIG_AVDEVICE
-    avdevice_register_all();
-#endif
-    avformat_network_init();
-
-    signal(SIGINT, sigterm_handler);  /* Interrupt (ANSI).    */
-    signal(SIGTERM, sigterm_handler); /* Termination (ANSI).  */
-
-    show_banner(argc, argv, options);
-
-    parse_options(NULL, argc, argv, options, opt_input_file);
-
-    if (!input_filename)
-    {
-        show_usage();
-        av_log(NULL, AV_LOG_FATAL, "An input file must be specified\n");
-        av_log(NULL, AV_LOG_FATAL,
-               "Use -h to get full help or, even better, run 'man %s'\n", program_name_ffplaykit);
-        exit(1);
-    }
-
-    if (display_disable)
-    {
-        video_disable = 1;
-    }
+    // SDL Options ===>>
     flags = SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_TIMER;
     if (audio_disable)
         flags &= ~SDL_INIT_AUDIO;
@@ -4234,46 +4647,179 @@ int main(int argc, char **argv)
 #ifdef SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR
         SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR, "0");
 #endif
+        av_log(NULL, AV_LOG_INFO, "default_width: %d, default_height: %d\n", default_width, default_height);
         window = SDL_CreateWindow(program_name_ffplaykit, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, default_width, default_height, flags);
         SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
-        if (window)
-        {
-            renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-            if (!renderer)
-            {
-                av_log(NULL, AV_LOG_WARNING, "Failed to initialize a hardware accelerated renderer: %s\n", SDL_GetError());
-                renderer = SDL_CreateRenderer(window, -1, 0);
-            }
-            if (renderer)
-            {
-                if (!SDL_GetRendererInfo(renderer, &renderer_info))
-                    av_log(NULL, AV_LOG_VERBOSE, "Initialized %s renderer.\n", renderer_info.name);
-            }
+    }
+    // <<===   SDL Options
+    return ;
+}
+
+/* Called from the main */
+// 20241128 ffplay_main 
+int main(int argc, char **argv)
+{
+
+    // 注册信号处理函数
+    // signal(SIGSEGV, signal_handler);
+
+    int ret;
+    // VideoState *is;
+    if (!video_group)
+        video_group = av_mallocz(sizeof(struct VideoGroup));
+
+    // memset(&userControl, 0, sizeof(UserControl));
+    atomic_init(&userControl.touch_state, false);
+    atomic_init(&userControl.slide_state, E_SLIDE_OFF);
+    atomic_init(&userControl.slide_state_last_frame, E_SLIDE_OFF);
+
+    // atomic_init(&rect_offset_x, 0);
+    // atomic_init(&rect_offset_y, 0);
+
+    SDLSetting();
+
+    init_dynload();
+
+    av_log_set_flags(AV_LOG_SKIP_REPEATED);
+    parse_loglevel(argc, argv, options);
+
+    /* register all codecs, demux and protocols */
+#if CONFIG_AVDEVICE
+    avdevice_register_all();
+#endif
+    avformat_network_init();
+
+    signal(SIGINT, sigterm_handler);  /* Interrupt (ANSI).    */
+    signal(SIGTERM, sigterm_handler); /* Termination (ANSI).  */
+
+    show_banner(argc, argv, options);
+
+    // argc,argv 由一个input改为多个input，每个input之间使用分隔符"delimiter"分隔。
+    // ffplay argv[0]的值为"ffplay"，参数从下标1开始。改造后从"delimiter"的下一个开始。
+    // argv[0] 被SDL在SDL_android.c中替换为了"app_process"
+    int delimiter_size = 0;
+    int *delimiter_indexes = NULL;
+    if (argc <= 0) {
+        av_log(NULL, AV_LOG_WARNING, "No parameter.\n");
+        return 0;
+    }
+    for (int i = 0; i < argc; i++) {
+        if (!strcmp(argv[i], "delimiter") || !strcmp(argv[i], "app_process"))
+            delimiter_size++;
+    }
+    av_log(NULL, AV_LOG_INFO, "delimiter_size: %d\n", delimiter_size);
+    delimiter_indexes = (int *)malloc(sizeof(int) * delimiter_size);
+    memset(delimiter_indexes, 0, sizeof(int) * delimiter_size);
+    for (int i = 0, j = 0; i < argc; i++)
+    {
+        if (!strcmp(argv[i], "delimiter") || !strcmp(argv[i], "app_process")) {
+            delimiter_indexes[j++] = i;
+            av_log(NULL, AV_LOG_INFO, "delimiter_indexes[%d]:%d\n", j - 1, delimiter_indexes[j - 1]);
         }
-        if (!window || !renderer || !renderer_info.num_texture_formats)
+    }
+    int sub_argc = 0;
+    char **sub_argv = NULL;
+    for (int i = 0; i < delimiter_size; i++) {
+        if (i != delimiter_size - 1) {
+            sub_argc = delimiter_indexes[i + 1] - delimiter_indexes[i];
+        } else {
+            sub_argc = argc - delimiter_indexes[i];
+        }
+        sub_argv = &argv[delimiter_indexes[i]];
+        if (sub_argc > 1)
         {
-            av_log(NULL, AV_LOG_FATAL, "Failed to create window or renderer: %s", SDL_GetError());
+            av_log(NULL, AV_LOG_INFO, "sub_argc: %d\n", sub_argc);
+            for (int j = 0; j < sub_argc; j++) {
+                av_log(NULL, AV_LOG_INFO, "sub_argv: %s\n", sub_argv[j]);
+            }
+            parse_options(NULL, sub_argc, sub_argv, options, opt_input_file);
+            if (!input_filename)
+            {
+                show_usage();
+                av_log(NULL, AV_LOG_FATAL, "An input file must be specified\n");
+                av_log(NULL, AV_LOG_FATAL,
+                       "Use -h to get full help or, even better, run 'man %s'\n", program_name_ffplaykit);
+                exit(1);
+            }
+            if (display_disable)
+            {
+                video_disable = 1;
+            }
+
+            VideoState *is = create_video_state();
+            is->v_argc = sub_argc;
+            is->v_argv = av_mallocz(sizeof(char *) * sub_argc);
+            for (int i = 0; i < is->v_argc; i++)
+            {
+                is->v_argv[i] = av_strdup(sub_argv[i]);
+            }
+            is->filename = av_strdup(input_filename);
+            is->iformat = file_iformat;
+            group_push_back(video_group, is);
+        }
+    }
+   
+    // Play
+    VideoState *cur_state = group_front(video_group), *next = NULL;
+    // group_pop(video_group);
+    userControl.prev_vid = NULL;
+    userControl.cur_vid = cur_state;
+    userControl.next_vid = cur_state->next;
+    g_renderer = create_renderer(window);
+    while (cur_state)
+    {
+        // g_renderer = create_renderer(window);
+        ret = stream_open(cur_state);
+        if (ret < 0)
+        {
+            av_log(NULL, AV_LOG_FATAL, "Failed to initialize VideoState!\n");
             do_exit(NULL);
         }
+        av_log(NULL, AV_LOG_INFO, "stream_open: %d\n", ret);
+
+        event_loop(cur_state);
+        next = cur_state->next;
+        userControl.next_vid = next;
+        // destroy_renderer(g_renderer);
+        // autoexit, FF_QUIT_EVENT 之后不调do_exit。需要进入下一次播放，只需要做一部分uninit操作。
+        if (cur_state)
+        {
+            av_log(NULL, AV_LOG_INFO, "stream_close\n");
+            stream_close(cur_state);
+        }
+        
+#if CONFIG_AVFILTER
+            av_freep(&vfilters_list);
+#endif
+        if (show_status)
+            printf("\n");
+        // av_log(NULL, AV_LOG_QUIET, "%s", "");
+        av_log(NULL, AV_LOG_INFO, "Once play end\n");
+        cur_state = next;
     }
-
-    is = stream_open(input_filename, file_iformat);
-    if (!is)
-    {
-        av_log(NULL, AV_LOG_FATAL, "Failed to initialize VideoState!\n");
-        do_exit(NULL);
-    }
-
-    event_loop(is);
-
-    /* never returns */
-
+    destroy_renderer(g_renderer);
+    uninit_opts();
+    av_log(NULL, AV_LOG_INFO, "uninit_opts\n");
+/*     if (renderer)
+        SDL_DestroyRenderer(renderer); */
+    if (window)
+        SDL_DestroyWindow(window);
+#if CONFIG_AVFILTER
+    av_freep(&vfilters_list);
+#endif
+    avformat_network_deinit();
+    SDL_Quit();
+    av_log(NULL, AV_LOG_QUIET, "%s", "");
+    exit(0);
     return 0;
+
 }
 
 // <<======  ffplay.c end
 
-int ffplay_main_bak(int argc, char **argv){
+
+int ffplay_group_main(int argc, char **argv){
+    
     return 0;
 }
 
@@ -4333,20 +4879,60 @@ JNIEXPORT jint JNICALL Java_org_libsdl_app_FFplayKit_nativeFFplayPositionOffset(
 {
     int returnCode = 0;
     LOGI("nativeFFplayPositionOffset: [%f, %f]", offset_x, offset_y);
-    render_position_offset[0] = offset_x;
-    render_position_offset[1] = offset_y;
+    atomic_store(&touch_move_xy[0], offset_x);
+    atomic_store(&touch_move_xy[1], offset_y);
     return returnCode;
 }
 
 void ffplaykit_set_position_offset(float x, float y) {
-    render_position_offset[0] = x;
-    render_position_offset[1] = y;
+    atomic_store(&touch_move_xy[0], 100); /* x - touch_down_xy[0] */ ;                                          // 只允许上下滑动
+    atomic_store(&touch_move_xy[1], y);                                                                  /* - touch_down_xy[1] */
+    ;
     // LOGI("ffplaykit_set_position_offset:[%f, %f]", x, y);
-    if (0 && renderer) {
+/*     if (0 && renderer) {
         LOGI("ffplaykit_set_position_offset call SDL:[%f, %f]", x, y);
         SDL_SetVertexPositionOffset(renderer,
-                                    render_position_offset[0],
-                                    render_position_offset[1]);
+                                    touch_move_xy[0],
+                                    touch_move_xy[1]);
     }
-        
+         */
+}
+
+void ffplaykit_set_touch_action_down(float x, float y)
+{
+    LOGI("ffplaykit_set_touch_action_down: [%f, %f]", x, y);
+    atomic_store(&touch_down_xy[0], 100.0);  // 只允许上下滑动
+    atomic_store(&touch_down_xy[1],y);
+    atomic_store(&touch_move_xy[0], 100);
+    atomic_store(&touch_move_xy[1], y);
+
+    atomic_store(&touch_on, 1);
+    //atomic_store(&userControl.touch_state, true);
+    // atomic_store(&userControl.slide_state, E_SLIDE_FOLLOWING);
+}
+
+void ffplaykit_set_touch_action_up(float x, float y)
+{
+    LOGI("ffplaykit_set_touch_action_up: [%f, %f]", x, y);
+    if (1 == atomic_load(&touch_on))
+    {
+        atomic_store(&touch_up_xy[0], 100) /* x - touch_down_xy[0] */; // 只允许上下滑动
+        atomic_store(&touch_up_xy[1], y) /*  - touch_down_xy[1] */;
+        atomic_store(&touch_on, 0);
+    } else {
+        LOGI("ffplaykit_set_touch_action_up: touch_on has been released by code.");
+    }
+
+    //atomic_store(&userControl.touch_state, false);
+    /* 
+    if (fabsf(y - touch_down_xy[1]) > 1000)
+    {
+        LOGI("Touch up cause exchange next video\n");
+        atomic_store(&userControl.slide_state, E_SLIDE_SLIP_OUT);
+    }
+    else
+    {
+        atomic_store(&userControl.slide_state, E_SLIDE_BACK);
+    } */
+    
 }

@@ -135,9 +135,35 @@ public class SDLActivity extends Activity {
      */
     protected String[] getArguments() {
         // return new String[0];
+        // /storage/emulated/0/UltimatClarity_h264_1080p.mp4
+        // /storage/emulated/0/TrumpTalksSocialism.mp4
         String[] str = new String[] { 
-            "-i","/storage/emulated/0/TrumpTalksSocialism.mp4", // TrumpTalksSocialism.mp4, UltimatClarity_h264_1080p.mp4
-            "-autoexit"
+            /* "-i", "/storage/emulated/0/1_MyFile/short_videos/ALuTPKL_POEEng9R.mp4",
+            "-autoexit", "-loop", "-1",
+            "delimiter",
+            "-i", "/storage/emulated/0/1_MyFile/short_videos/KrHWtM4JbxcieFnK.mp4",
+            "-autoexit", "-loop", "-1",
+            "delimiter",
+            "-i", "/storage/emulated/0/1_MyFile/short_videos/-OFC2V3IkvOmQv3Z.mp4",
+            "-autoexit", "-loop", "-1",
+            "delimiter",
+            "-i", "/storage/emulated/0/1_MyFile/short_videos/OKsMpsYifRPT_8eC.mp4",
+            "-autoexit", "-loop", "-1" */    
+            // caYLAMXGGjslZLYO_540x1278.mp4
+                "-i", "/storage/emulated/0/1_MyFile/short_videos/caYLAMXGGjslZLYO_540x1278.mp4",
+                "-autoexit", "-loop", "-1",
+                "delimiter",
+                "-i", "/storage/emulated/0/1_MyFile/short_videos/Hqk31W3TNI.mp4",
+                "-autoexit", "-loop", "-1",
+                "delimiter",
+                "-i", "/storage/emulated/0/1_MyFile/short_videos/Massimo.mp4",
+                "-autoexit", "-loop", "-1",
+                "delimiter",
+                "-i", "/storage/emulated/0/1_MyFile/short_videos/Monrowl.mp4",
+                "-autoexit", "-loop", "-1",
+                "delimiter",
+                "-i", "/storage/emulated/0/1_MyFile/short_videos/SongChiGan.mp4",
+                "-autoexit", "-loop", "-1"               
         };
         return str;
     }
@@ -490,8 +516,9 @@ public class SDLActivity extends Activity {
                 //Toast.makeText(this, "Action Down at (" + x + ", " + y + ")", Toast.LENGTH_SHORT).show();
                 Log.i(TAG, "Action Down at (" + x + ", " + y + ")");
                 // nativeSetPositionOffset(x, y);
-                touchDownPositionX = x;
-                touchDownPositionY = y;
+                // touchDownPositionX = x;
+                // touchDownPositionY = y;
+                sdl_main.SetTouchActionDown((float)x, (float)y);
                 break;
 
             case MotionEvent.ACTION_MOVE:
@@ -501,17 +528,20 @@ public class SDLActivity extends Activity {
                     (float) (((int)(x - touchDownPositionX)/2)*2), 
                     (float) (((int) (y - touchDownPositionY) / 2) * 2)); */
                 sdl_main.SetPositionOffset(
-                        (float) (x - touchDownPositionX),
-                        (float) (y - touchDownPositionY));
+                        (float) (x/*  - touchDownPositionX */),
+                        (float) (y/*  - touchDownPositionY */));
                 break;
 
             case MotionEvent.ACTION_UP:
                 // 手指抬起
                 //Toast.makeText(this, "Action Up at (" + x + ", " + y + ")", Toast.LENGTH_SHORT).show();
                 Log.i(TAG, "Action Up at (" + x + ", " + y + ")");
-                sdl_main.SetPositionOffset((float)0.0, (float)0.0);
-                touchDownPositionX = (float)0.0;
-                touchDownPositionY = (float)0.0;                
+                // sdl_main.SetPositionOffset((float)0.0, (float)0.0);
+                sdl_main.SetTouchActionUp(
+                        (float) (x/*  - touchDownPositionX */),
+                        (float) (y/*  - touchDownPositionY */));
+                // touchDownPositionX = (float) 0.0;
+                // touchDownPositionY = (float) 0.0;            
                 break;
 
             default:
@@ -662,7 +692,8 @@ public class SDLActivity extends Activity {
     public static native String nativeGetHint(String name);
     public static native void nativeSetenv(String name, String value);
     public static native void nativeSetPositionOffset(long handle, float offset_x, float offset_y);
-
+    public static native void nativeSetTouchActionDown(long handle, float offset_x, float offset_y);
+    public static native void nativeSetTouchActionUp(long handle, float offset_x, float offset_y);
     /**
      * This method is called by SDL using JNI.
      */
@@ -1225,6 +1256,12 @@ class SDLMain implements Runnable {
     public void SetPositionOffset(Float x, Float y) {
         SDLActivity.nativeSetPositionOffset(dl_handle, x, y);
     }
+    public void SetTouchActionDown(Float x, Float y) {
+        SDLActivity.nativeSetTouchActionDown(dl_handle, x, y);
+    }
+    public void SetTouchActionUp(Float x, Float y) {
+        SDLActivity.nativeSetTouchActionUp(dl_handle, x, y);
+    }    
 }
 
 
