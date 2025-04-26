@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #include "ffmpegkit.h"
 // #include "ffplaykit.h"
@@ -98,6 +100,8 @@ const char program_name_ffplaykit[] = "ffplay";
 
 #define USE_ONEPASS_SUBTITLE_RENDER 1
 
+// #define PREVENT_DEFAULT_AUDIO_AVFILTER
+
 static unsigned sws_flags = SWS_BICUBIC;
 
 typedef struct MyAVPacketList
@@ -113,7 +117,7 @@ typedef struct PacketQueue
     int size;
     int64_t duration;
     int abort_request;
-    int serial;
+    int serial;    // 记录seek后flush的次数 ???
     SDL_mutex *mutex;
     SDL_cond *cond;
 } PacketQueue;
@@ -163,12 +167,16 @@ typedef struct Frame
 typedef struct FrameQueue
 {
     Frame queue[FRAME_QUEUE_SIZE];
-    int rindex; // read index
+    int rindex; // read index，也就是当前帧
     int windex; // write index，下一个等待写入的帧
     int size;   // 当前的帧数
     int max_size; // 允许最大帧数
+    /* keep_last 的意思是， 调用 frame_queue_next函数 pop出一帧时：
+        1、如果rindex没有渲染过，则只标记rindex_shown为1，rindex不变，这一帧还保留在队列里；
+        2、如果rindex已经渲染过了，则清除出队列
+    */
     int keep_last; // default setting: video - 1; audio - 0; sub - 0.
-    int rindex_shown; // rindex是否已经渲染了？
+    int rindex_shown; // rindex 第一帧是否已经渲染了.  
     SDL_mutex *mutex;
     SDL_cond *cond;
     PacketQueue *pktq;
@@ -254,7 +262,7 @@ typedef struct VideoState
     struct AudioParams audio_tgt;
     struct SwrContext *swr_ctx;
     int frame_drops_early;
-    int frame_drops_late;
+    int frame_drops_late;  // 丢掉的帧的计数
 
     enum ShowMode
     {
@@ -280,7 +288,7 @@ typedef struct VideoState
     AVStream *subtitle_st;
     PacketQueue subtitleq;
 
-    double frame_timer;
+    double frame_timer;  // 当前帧开始显示的时间点，单位秒
     double frame_last_returned_time;
     double frame_last_filter_delay;
     int video_stream;
@@ -309,27 +317,25 @@ typedef struct VideoState
     SDL_cond *continue_read_thread;
     int video_frame_rendered;
     int need_refresh_pos;
-    float last_x, last_y;
-    int64_t last_time; // ms
 
     // New 
     struct VideoState *prev, *next;
     int v_argc;
     char* *v_argv;
+    int vs_index;
     SDL_Renderer *v_renderer;
-#define E_PLAY_STATUE_STOP 0
-#define E_PLAY_STATUE_PREPARING 1
-#define E_PLAY_STATUE_PREPARED 2
-#define E_PLAY_STATUE_PLAYING 3
-#define E_PLAY_STATUE_PAUSE 4
-    int play_status;
+#define E_PLAY_STATE_STOPPED 0
+#define E_PLAY_STATE_STOPPING 1
+#define E_PLAY_STATE_OPENING 2
+#define E_PLAY_STATE_PLAYING 3
+#define E_PLAY_STATE_PAUSE 4
+#define E_PLAY_STATE_HIBERNATION 5
+#define E_PLAY_STATE_FAILED 99
+    int play_state;
+    int hibernate; // 1 - 需要进入到E_PLAY_STATE_HIBERNATION状态，而不论之前是什么状态；0 - 不进入E_PLAY_STATE_HIBERNATION状态
+    int current;
 
-    float current_video_xy[2]; // 当前视频的偏移坐标
-    float release_video_xy[2]; // 松手时的视频偏移坐标
-    float press_video_xy[2];   // 按下时视频的偏移坐标
-    int64_t touch_down_time;   // 手指按下的时刻
-    int64_t touch_up_time;     // 手指抬起的时刻
-
+    char *afilters;
 } VideoState;
 
 typedef struct VideoGroup {
@@ -338,7 +344,6 @@ typedef struct VideoGroup {
 } VideoGroup;
 
 typedef struct UserControl {
-	VideoState *cur_vid, *prev_vid, *next_vid;
 	int offset_x, offset_y;
 #define E_TOUCH_OFF 0x0
 #define E_TOUCH_ON 0x1
@@ -346,7 +351,8 @@ typedef struct UserControl {
 #define E_SLIDE_OFF 0x0       // 未触摸屏幕
 #define E_SLIDE_FOLLOWING 0x1 // 按住，纹理坐标跟随触点
 #define E_SLIDE_BACK 0x2      // 已松开，纹理正滑到对齐屏幕
-#define E_SLIDE_SLIP_OUT 0x3  // 已松开，纹理正滑出屏幕上/下方
+#define E_SLIDE_SLIP_OUT_UP 0x3  // 已松开，纹理正向上滑出屏幕
+#define E_SLIDE_SLIP_OUT_DOWN 0x4 // 已松开，纹理正向下滑出屏幕
     atomic_int slide_state, slide_state_last_frame;
     /* ETouch cur_touch;
     Enum EShowState {
@@ -365,6 +371,14 @@ typedef struct UserControl {
         状态切换（!next_vid）：
         2、
     }*/
+    float current_video_xy[2]; // 当前视频的偏移坐标
+    float release_video_xy[2]; // 松手时的视频偏移坐标
+    float press_video_xy[2];   // 按下时视频的偏移坐标
+    int64_t touch_down_time;   // 手指按下的时刻
+    int64_t touch_up_time;     // 手指抬起的时刻
+    float last_video_xy[2];
+    int64_t last_time; // ms
+    float slip_initial_speed[2];
 } UserControl;
 
 static UserControl userControl;
@@ -377,6 +391,8 @@ extern __thread long globalSessionId;
 
 /** Session control variables */
 #define SESSION_MAP_SIZE 1000
+
+#ifdef ASYNC_LOG_OUT
 // static atomic_short sessionMap[SESSION_MAP_SIZE];
 static atomic_int sessionInTransitMessageCountMap[SESSION_MAP_SIZE];
 
@@ -387,7 +403,7 @@ static pthread_cond_t monitorCondition;
 
 static struct CallbackData *callbackDataHead;
 static struct CallbackData *callbackDataTail;
-
+#endif
 /* options specified by the user */
 static const AVInputFormat *file_iformat; // private
 static const char *input_filename;        // private
@@ -443,6 +459,8 @@ static int is_full_screen; // global
 static int64_t audio_callback_time; // private
 
 #define FF_QUIT_EVENT (SDL_USEREVENT + 2)
+#define FF_TOGGLE_NEXT_EVENT (SDL_USEREVENT + 3)
+#define FF_TOGGLE_PREV_EVENT (SDL_USEREVENT + 4)
 
 static SDL_Window *window; // global
 // static SDL_Renderer *renderer; // private
@@ -481,13 +499,11 @@ static atomic_int touch_on_last = 0;
 static _Atomic float touch_down_xy[2] = {0.0, 0.0}; // 手指按下时的坐标
 static _Atomic float touch_move_xy[2] = {0.0, 0.0}; // 手指实时的坐标
 static _Atomic float touch_up_xy[2] = {0.0, 0.0}; // 手指抬起时的坐标
-// static float accumulate_move_xy[2] = {0.0, 0.0};
-// static float last_frame_xy[2] = {0.0, 0.0};    // 上一帧的偏移坐标
-// static atomic_int rect_offset_x, rect_offset_y; // 用户滑动时视频实际偏移
 #define LONG_DISTANCE 1200
-#define SHORT_DISTANCE 150
+#define SHORT_DISTANCE 120
 #define THRESHOLD_TIME 150
 
+#define VIDEO_BUFFER_NUM 3
 
 /**
  * 速度平滑运动算法
@@ -591,9 +607,14 @@ speedSmoothMove(float step_time, float lastX, float lastY, float startX, float s
 }
 
 static void speedUpMoveOut(float step_time, float lastX, float lastY, float startX, float startY, float endX, float endY,
-                            float accelFactor, float *currentX, float *currentY)
+                           float accelFactor, float *currentX, float *currentY, float initialSpeedX, float initialSpeedY)
 {
-    float avg_speed_x = (endX - startX) / 200, avg_speed_y = (endY - startY) / 200;
+    float avg_speed_x = (endX - startX) / 150, avg_speed_y = (endY - startY) / 150;
+    /* float init_speed_x = initialSpeedX == 0.0 ? avg_speed_x / 2 : initialSpeedX;
+    float init_speed_y = initialSpeedY == 0.0 ? avg_speed_y / 2 : initialSpeedY;
+    float cur_speed_x = (lastX - startX) / (endX - startX) * (avg_speed_x - init_speed_x) + init_speed_x;
+    float cur_speed_y = (lastY - startY) / (endY - startY) * (avg_speed_y - init_speed_y) + init_speed_y; */
+    // av_log(NULL, AV_LOG_INFO, "speedUpMoveOut. initialSpeed: [%f, %f], avg_speed: [%f, %f] \n", initialSpeedX, initialSpeedY, avg_speed_x, avg_speed_y);
     if (fabsf(step_time * avg_speed_x) > fabsf(lastX - endX))
         *currentX = endX;
     else
@@ -605,6 +626,7 @@ static void speedUpMoveOut(float step_time, float lastX, float lastY, float star
     return;
 }
 
+#ifdef ASYNC_LOG_OUT
 /**
  * Adds log data to the end of callback data list.
  *
@@ -653,6 +675,7 @@ static void logCallbackDataAdd(int level, AVBPrint *data)
 
     atomic_fetch_add(&sessionInTransitMessageCountMap[globalSessionId % SESSION_MAP_SIZE], 1);
 }
+#endif
 
 /**
  * Callback function for FFmpeg logs.
@@ -689,7 +712,48 @@ void ffplaykit_log_callback_function(void *ptr, int level, const char* format, v
     av_bprintf(&fullLine, "%s%s%s%s", part[0].str, part[1].str, part[2].str, part[3].str);
 
     if (fullLine.len > 0) {
+#ifdef ASYNC_LOG_OUT        
         logCallbackDataAdd(level, &fullLine);
+#else
+#define FFPLAYKIT_LOG_TAG "FfplayKit"
+        if (AV_LOG_QUIET == level) {
+            __android_log_print(ANDROID_LOG_SILENT, FFPLAYKIT_LOG_TAG, "%s", fullLine.str);
+        }
+        else if (AV_LOG_PANIC == level)
+        {
+            __android_log_print(ANDROID_LOG_FATAL, FFPLAYKIT_LOG_TAG, "%s", fullLine.str);
+        }
+        else if (AV_LOG_FATAL == level)
+        {
+            __android_log_print(ANDROID_LOG_FATAL, FFPLAYKIT_LOG_TAG, "%s", fullLine.str);
+        }
+        else if (AV_LOG_ERROR == level)
+        {
+            __android_log_print(ANDROID_LOG_ERROR, FFPLAYKIT_LOG_TAG, "%s", fullLine.str);
+        }
+        else if (AV_LOG_WARNING == level)
+        {
+            __android_log_print(ANDROID_LOG_WARN, FFPLAYKIT_LOG_TAG, "%s", fullLine.str);
+        }
+        else if (AV_LOG_INFO == level)
+        {
+            __android_log_print(ANDROID_LOG_INFO, FFPLAYKIT_LOG_TAG, "%s", fullLine.str);
+        }
+        else if (AV_LOG_VERBOSE == level)
+        {
+            __android_log_print(ANDROID_LOG_VERBOSE, FFPLAYKIT_LOG_TAG, "%s", fullLine.str);
+        }
+        else if (AV_LOG_DEBUG == level)
+        {
+            __android_log_print(ANDROID_LOG_DEBUG, FFPLAYKIT_LOG_TAG, "%s", fullLine.str);
+        }
+        else if (AV_LOG_TRACE == level)
+        {
+            __android_log_print(ANDROID_LOG_DEBUG, FFPLAYKIT_LOG_TAG, "%s", fullLine.str);
+        } else {
+            __android_log_print(ANDROID_LOG_DEFAULT, FFPLAYKIT_LOG_TAG, "%s", fullLine.str);
+        }
+#endif
     }
 
     av_bprint_finalize(part, NULL);
@@ -724,6 +788,8 @@ static void group_push_back(VideoGroup* vg, VideoState* vs)
     if (!v)
     {
         vg->video_state_head = vs;
+        vs->next = NULL;
+        vs->prev = NULL;
         return;
     }
     while (v->next)
@@ -731,6 +797,7 @@ static void group_push_back(VideoGroup* vg, VideoState* vs)
         v = v->next;
     }
     v->next = vs;
+    vs->prev = v;
     vs->next = NULL;
     return;
 }
@@ -751,6 +818,20 @@ static VideoState* group_front(VideoGroup* vg)
     }
     return ;
 } */
+
+static int group_size(VideoGroup* vg)
+{
+    int size = 0;
+    VideoState *v = vg->video_state_head;
+    while(v){
+        size++;
+        v = v->next;
+    }
+    return size;
+}
+
+static int vs_get_play_state(VideoState *vs);
+
 
 static int packet_queue_put_private(PacketQueue *q, AVPacket *pkt)
 {
@@ -992,7 +1073,7 @@ static int decoder_decode_frame(Decoder *d, AVFrame *frame, AVSubtitle *sub)
             {
                 int old_serial = d->pkt_serial;
                 if (packet_queue_get(d->queue, d->pkt, 1, &d->pkt_serial) < 0)
-                    return -1;
+                    return -2;
                 if (old_serial != d->pkt_serial)
                 {
                     avcodec_flush_buffers(d->avctx);
@@ -1093,17 +1174,17 @@ static void frame_queue_signal(FrameQueue *f)
     SDL_CondSignal(f->cond);
     SDL_UnlockMutex(f->mutex);
 }
-
+// 获取未显示的一帧
 static Frame *frame_queue_peek(FrameQueue *f)
 {
     return &f->queue[(f->rindex + f->rindex_shown) % f->max_size];
 }
-
+// 获取未显示的一帧的下一帧
 static Frame *frame_queue_peek_next(FrameQueue *f)
 {
     return &f->queue[(f->rindex + f->rindex_shown + 1) % f->max_size];
 }
-
+// 获取最新的一帧，无论是否已经显示
 static Frame *frame_queue_peek_last(FrameQueue *f)
 {
     return &f->queue[f->rindex];
@@ -1126,7 +1207,7 @@ static Frame *frame_queue_peek_writable(FrameQueue *f)
 
     return &f->queue[f->windex];
 }
-
+// wait直到至少有未显示过的一帧
 static Frame *frame_queue_peek_readable(FrameQueue *f)
 {
     /* wait until we have a readable a new frame */
@@ -1144,7 +1225,7 @@ static Frame *frame_queue_peek_readable(FrameQueue *f)
     return &f->queue[(f->rindex + f->rindex_shown) % f->max_size];
 }
 
-// 应当已经写入了帧数据，这里只需要把windex++
+// 应当已经写入了帧数据，这里只需要把windex++，流程看 queue_picture
 static void frame_queue_push(FrameQueue *f)
 {
     if (++f->windex == f->max_size)
@@ -1178,6 +1259,7 @@ static int frame_queue_nb_remaining(FrameQueue *f)
     return f->size - f->rindex_shown;
 }
 
+// 获取当前帧 rindex 在原文件中的位置
 /* return last shown position */
 static int64_t frame_queue_last_pos(FrameQueue *f)
 {
@@ -1211,15 +1293,19 @@ static inline void fill_rectangle(SDL_Renderer *renderer, int x, int y, int w, i
 static int realloc_texture(SDL_Renderer *renderer, SDL_Texture **texture, Uint32 new_format, int new_width, int new_height, SDL_BlendMode blendmode, int init_texture)
 {
     Uint32 format;
-    int access, w, h;
-    if (!*texture || SDL_QueryTexture(*texture, &format, &access, &w, &h) < 0 || new_width != w || new_height != h || new_format != format)
+    int access, w, h, ret;
+    // av_log(NULL, AV_LOG_INFO, "realloc_texture. new_width, new_height: [%d, %d]!\n", new_width, new_height);
+    if (!*texture || (ret = SDL_QueryTexture(*texture, &format, &access, &w, &h)) < 0 || new_width != w || new_height != h || new_format != format)
     {
         void *pixels;
         int pitch;
         if (*texture)
             SDL_DestroyTexture(*texture);
-        if (!(*texture = SDL_CreateTexture(renderer, new_format, SDL_TEXTUREACCESS_STREAMING, new_width, new_height)))
+        if (!(*texture = SDL_CreateTexture(renderer, new_format, SDL_TEXTUREACCESS_STREAMING, new_width, new_height))) {
+            av_log(NULL, AV_LOG_INFO, "SDL_CreateTexture. Failed! new_format: %s, format: %s. new_width: %d, w: %d. new_height: %d, h: %d. SDL_QueryTexture: %d.\n", SDL_GetPixelFormatName(new_format), SDL_GetPixelFormatName(format), new_width, w, new_height, h, ret);
             return -1;
+        }
+        av_log(NULL, AV_LOG_INFO, "SDL_CreateTexture. Successed!\n");
         if (SDL_SetTextureBlendMode(*texture, blendmode) < 0)
             return -1;
         if (init_texture)
@@ -1250,6 +1336,7 @@ static void calculate_display_rect(SDL_Rect *rect,
 {
     AVRational aspect_ratio = pic_sar;
     int64_t width, height, x, y;  //视频在屏幕上的宽高与坐标，单位应该是屏幕像素个数
+    // av_log(NULL, AV_LOG_INFO, "calculate_display_rect. scr_xleft: %d, scr_ytop: %d, scr_width: %d, scr_height: %d, pic_width: %d, pic_height: %d\n", scr_xleft, scr_ytop, scr_width, scr_height, pic_width, pic_height);
 
     if (av_cmp_q(aspect_ratio, av_make_q(0, 1)) <= 0)
         aspect_ratio = av_make_q(1, 1);
@@ -1332,12 +1419,14 @@ static int upload_texture(SDL_Renderer *renderer, SDL_Texture **tex, AVFrame *fr
             ret = SDL_UpdateYUVTexture(*tex, NULL, frame->data[0], frame->linesize[0],
                                        frame->data[1], frame->linesize[1],
                                        frame->data[2], frame->linesize[2]);
+            // av_log(NULL, AV_LOG_INFO, "upload_texture. SDL_UpdateYUVTexture(1): %d. \n", ret);
         }
         else if (frame->linesize[0] < 0 && frame->linesize[1] < 0 && frame->linesize[2] < 0)
         {
             ret = SDL_UpdateYUVTexture(*tex, NULL, frame->data[0] + frame->linesize[0] * (frame->height - 1), -frame->linesize[0],
                                        frame->data[1] + frame->linesize[1] * (AV_CEIL_RSHIFT(frame->height, 1) - 1), -frame->linesize[1],
                                        frame->data[2] + frame->linesize[2] * (AV_CEIL_RSHIFT(frame->height, 1) - 1), -frame->linesize[2]);
+            // av_log(NULL, AV_LOG_INFO, "upload_texture. SDL_UpdateYUVTexture(2): %d. \n", ret);
         }
         else
         {
@@ -1376,13 +1465,18 @@ static void set_sdl_yuv_conversion_mode(AVFrame *frame)
 #endif
 }
 
+// 用最新的坐标渲染一次rindex，无论是否被渲染过
 static void video_image_display(VideoState *is)
 {
     Frame *vp;
     Frame *sp = NULL;
     SDL_Rect rect;
-
+    // av_log(NULL, AV_LOG_INFO, "video_image_display. vs_index: %d\n", is->vs_index);
+    if ( frame_queue_nb_remaining(&is->pictq) == 0 ) {
+        av_log(NULL, AV_LOG_INFO, "video_image_display. frame queue nb is 0.\n");
+    }
     vp = frame_queue_peek_last(&is->pictq);
+    // av_log(NULL, AV_LOG_INFO, "video_image_display. vs_index: %d. play_state: %d, vp pts: %f\n", is->vs_index, is->play_state, vp->pts);
     if (is->subtitle_st)
     {
         if (frame_queue_nb_remaining(&is->subpq) > 0)
@@ -1438,8 +1532,23 @@ static void video_image_display(VideoState *is)
     }
 
     calculate_display_rect(&rect, is->xleft, is->ytop, is->width, is->height, vp->width, vp->height, vp->sar);
-    rect.x += is->current_video_xy[0];
-    rect.y += is->current_video_xy[1];
+    // 视频滑动时的坐标偏移
+    rect.x += userControl.current_video_xy[0];
+    rect.y += userControl.current_video_xy[1];
+    // 当该视频不是播放中的视频
+    if (!is->current) {
+        if (is->prev && 1 == is->prev->current && userControl.current_video_xy[1] < 0) { // 下一个视频，且用户向上滑
+            rect.y += is->height;
+            // av_log(NULL, AV_LOG_INFO, "video_image_display. it's is->next. rect.y: %d. is->height: %d\n", rect.y, is->height);
+        }
+        else if (is->next && 1 == is->next->current && userControl.current_video_xy[1] > 0) { // 上一个视频，且用户向下滑
+            rect.y -= is->height;
+            // av_log(NULL, AV_LOG_INFO, "video_image_display. it's is->prev. rect.y: %d. is->height: %d\n", rect.y, is->height);
+        }
+        else
+            return;
+    }       
+    // av_log(NULL, AV_LOG_INFO, "video_image_display. vs_index: %d, rect: [%d, %d, %d, %d]\n", is->vs_index, rect.x, rect.y, rect.w, rect.h);
     set_sdl_yuv_conversion_mode(vp->frame);
 
     if (!vp->uploaded)
@@ -1447,6 +1556,7 @@ static void video_image_display(VideoState *is)
         // 将frame数据填充进纹理
         if (upload_texture(g_renderer, &is->vid_texture, vp->frame, &is->img_convert_ctx) < 0)
         {
+            av_log(NULL, AV_LOG_INFO, "video_image_display. upload_texture failed.\n");
             set_sdl_yuv_conversion_mode(NULL);
             return;
         }
@@ -1479,14 +1589,6 @@ static void video_image_display(VideoState *is)
         }
 #endif
     }
-    // 修正因上一个视频改过的坐标偏移。
-    // 放在这里合适吗？
-    /* if (1 == is->video_frame_rendered) {
-        SDL_SetVertexPositionOffset(g_renderer,
-                            is->last_x = 0.0,
-                            is->last_y = 0.0);
-
-    } */
 }
 
 static inline int compute_mod(int a, int b)
@@ -1673,6 +1775,7 @@ static void stream_component_close(VideoState *is, int stream_index)
     {
     case AVMEDIA_TYPE_AUDIO:
         decoder_abort(&is->auddec, &is->sampq);
+        av_log(NULL, AV_LOG_INFO, "stream_component_close. CloseAudioDevice.\n");
         SDL_CloseAudioDevice(audio_dev);
         decoder_destroy(&is->auddec);
         swr_free(&is->swr_ctx);
@@ -1747,14 +1850,16 @@ static void stream_close(VideoState *is)
     SDL_DestroyCond(is->continue_read_thread);
     sws_freeContext(is->img_convert_ctx);
     sws_freeContext(is->sub_convert_ctx);
-    av_free(is->filename);
+    // url始终保留，用于已关闭后重开
+    // av_free(is->filename);
     if (is->vis_texture)
         SDL_DestroyTexture(is->vis_texture);
     if (is->vid_texture)
         SDL_DestroyTexture(is->vid_texture);
     if (is->sub_texture)
         SDL_DestroyTexture(is->sub_texture);
-    av_free(is);
+    // VideoState保留
+    // av_free(is);
 }
 
 static void do_exit(VideoState *is)
@@ -1776,12 +1881,13 @@ static void do_exit(VideoState *is)
         printf("\n");
     SDL_Quit();
     av_log(NULL, AV_LOG_QUIET, "%s", "");
-    exit(0);
+    // exit(0);
 }
 
 static void sigterm_handler(int sig)
 {
-    exit(123);
+    // exit(123);
+    av_log(NULL, AV_LOG_WARNING, "sigterm_handler. sig: %d\n", sig);
 }
 
 static void set_default_window_size(int width, int height, AVRational sar)
@@ -1824,13 +1930,28 @@ static void video_display(VideoState *is)
 {
     if (!is->width)
         video_open(is);
-
+    if (is->next && !is->next->width)
+        video_open(is->next);
+    if (is->prev && !is->prev->width)
+        video_open(is->prev);
     SDL_SetRenderDrawColor(g_renderer, 0, 0, 0, 255);
     SDL_RenderClear(g_renderer);
     if (is->audio_st && is->show_mode != SHOW_MODE_VIDEO)
         video_audio_display(is);
-    else if (is->video_st)
+    else if (is->video_st) {
+        // av_log(NULL, AV_LOG_INFO, "video_image_display current: %d, vs_index: %d, play_state: %d\n", is->current, is->vs_index, is->play_state);
         video_image_display(is);
+        if (is->next && userControl.current_video_xy[1] < 0)
+        {
+            // av_log(NULL, AV_LOG_INFO, "video_image_display next. vs_index: %d, play_state: %d\n", is->next->vs_index, is->next->play_state);
+            video_image_display(is->next);
+        }
+        if (is->prev && userControl.current_video_xy[1] > 0)
+        {
+            // av_log(NULL, AV_LOG_INFO, "video_image_display prev. vs_index: %d, play_state: %d\n", is->prev->vs_index, is->prev->play_state);
+            video_image_display(is->prev);
+        }
+    }
     SDL_RenderPresent(g_renderer);
 }
 
@@ -1965,6 +2086,7 @@ static void stream_seek(VideoState *is, int64_t pos, int64_t rel, int by_bytes)
 /* pause or resume the video */
 static void stream_toggle_pause(VideoState *is)
 {
+    av_log(NULL, AV_LOG_INFO, "vs_index: %d. stream_toggle_pause begin. paused: %d\n", is->vs_index, is->paused);
     if (is->paused)
     {
         is->frame_timer += av_gettime_relative() / 1000000.0 - is->vidclk.last_updated;
@@ -1976,6 +2098,7 @@ static void stream_toggle_pause(VideoState *is)
     }
     set_clock(&is->extclk, get_clock(&is->extclk), is->extclk.serial);
     is->paused = is->audclk.paused = is->vidclk.paused = is->extclk.paused = !is->paused;
+    av_log(NULL, AV_LOG_INFO, "vs_index: %d. stream_toggle_pause end. paused: %d\n", is->vs_index, is->paused);
 }
 
 static void toggle_pause(VideoState *is)
@@ -2060,7 +2183,7 @@ static void update_video_pts(VideoState *is, double pts, int64_t pos, int serial
 }
 
 /* called to display each frame */
-static void video_refresh(void *opaque, double *remaining_time)
+static void video_refresh(void *opaque, double *remaining_time) // remaining_time: 每次循环sleep的时间间隔
 {
     VideoState *is = opaque;
     double time;
@@ -2070,15 +2193,15 @@ static void video_refresh(void *opaque, double *remaining_time)
     if (!is->paused && get_master_sync_type(is) == AV_SYNC_EXTERNAL_CLOCK && is->realtime)
         check_external_clock_speed(is);
 
-    if (!display_disable && is->show_mode != SHOW_MODE_VIDEO && is->audio_st)
+    if (!display_disable && is->show_mode != SHOW_MODE_VIDEO && is->audio_st)  //  非 Video 模式下
     {
         time = av_gettime_relative() / 1000000.0;
-        if (is->force_refresh || is->last_vis_time + rdftspeed < time)
+        if (is->force_refresh || is->last_vis_time + rdftspeed < time)  // 固定 20ms 间隔
         {
             video_display(is);
-            is->last_vis_time = time;
+            is->last_vis_time = time;  // 将本次时刻更新到上一次
         }
-        *remaining_time = FFMIN(*remaining_time, is->last_vis_time + rdftspeed - time);
+        *remaining_time = FFMIN(*remaining_time, is->last_vis_time + rdftspeed - time);  // 更新，还需要等多久才显示这一帧
     }
 
     if (is->video_st)
@@ -2094,35 +2217,49 @@ static void video_refresh(void *opaque, double *remaining_time)
             Frame *vp, *lastvp;
 
             /* dequeue the picture */
-            lastvp = frame_queue_peek_last(&is->pictq);
-            vp = frame_queue_peek(&is->pictq);
+            lastvp = frame_queue_peek_last(&is->pictq);  // 拿到 rindex，第一次未显示过，和vp是同一帧，第二次和以后均为显示过的了
+            vp = frame_queue_peek(&is->pictq);           // 拿未显示过的第一帧 rindex + rindex_shown
 
-            if (vp->serial != is->videoq.serial)
+            if (vp->serial != is->videoq.serial)  // 不能是跨seek的包/帧，否则都丢掉
             {
-                frame_queue_next(&is->pictq);
+                frame_queue_next(&is->pictq); // pop掉一帧
                 goto retry;
             }
 
-            if (lastvp->serial != vp->serial)
+            if (lastvp->serial != vp->serial)  // 如果跨seek了，说明pts跳变了
                 is->frame_timer = av_gettime_relative() / 1000000.0;
 
             if (is->paused)
                 goto display;
 
-            /* compute nominal last_duration */
-            last_duration = vp_duration(is, lastvp, vp);
-            delay = compute_target_delay(last_duration, is);
-
-            time = av_gettime_relative() / 1000000.0;
-            if (time < is->frame_timer + delay)
+            if (E_PLAY_STATE_HIBERNATION == vs_get_play_state(is))
             {
-                *remaining_time = FFMIN(is->frame_timer + delay - time, *remaining_time);
+                if (!is->pictq.rindex_shown)
+                    frame_queue_next(&is->pictq);
+                is->force_refresh = 1;
                 goto display;
             }
 
-            is->frame_timer += delay;
-            if (delay > 0 && time - is->frame_timer > AV_SYNC_THRESHOLD_MAX)
+            /* compute nominal last_duration */
+            last_duration = vp_duration(is, lastvp, vp);  // 根据两帧 pts 差，计算 duration
+            delay = compute_target_delay(last_duration, is);
+            // av_log(NULL, AV_LOG_INFO, "video_refresh. last_duration: %f, delay: %f. rindex_shown: %d, frame_timer: %f\n", last_duration, delay, is->pictq.rindex_shown, is->frame_timer);
+
+            time = av_gettime_relative() / 1000000.0;
+            if (time < is->frame_timer + delay) // 时间还没超。frame_timer初始值为0，所以第一次一定走不进来。
+            {
+                *remaining_time = FFMIN(is->frame_timer + delay - time, *remaining_time);
+                // av_log(NULL, AV_LOG_INFO, "video_refresh. remaining_time: %f. goto display\n", *remaining_time);
+                goto display; // 下一帧的时间还没到，只重复渲染rindex，应该是保证最低帧率
+            }
+            // av_log(NULL, AV_LOG_INFO, "video_refresh. not goto display.\n");
+
+            is->frame_timer += delay;  // 更新到以当前帧为起点
+            /* 如果当前时刻超应该显示的时刻太多，就从现在开始重新计算起始时间。可能是考虑卡住的情况？或者app切出去又切回来的情况？*/
+            if (delay > 0 && time - is->frame_timer > AV_SYNC_THRESHOLD_MAX) { // 第一次一定会走进来，设置有效的frame_timer
                 is->frame_timer = time;
+                // av_log(NULL, AV_LOG_INFO, "video_refresh. Greater than AV_SYNC_THRESHOLD_MAX. frame_timer: %f\n", is->frame_timer);
+            }
 
             SDL_LockMutex(is->pictq.mutex);
             if (!isnan(vp->pts))
@@ -2131,13 +2268,13 @@ static void video_refresh(void *opaque, double *remaining_time)
 
             if (frame_queue_nb_remaining(&is->pictq) > 1)
             {
-                Frame *nextvp = frame_queue_peek_next(&is->pictq);
+                Frame *nextvp = frame_queue_peek_next(&is->pictq); // 获取未显示的第二帧，以计算未显示的第一帧和第二帧的pts差
                 duration = vp_duration(is, vp, nextvp);
                 if (!is->step && (framedrop > 0 || (framedrop && get_master_sync_type(is) != AV_SYNC_VIDEO_MASTER)) && time > is->frame_timer + duration)
                 {
                     is->frame_drops_late++;
-                    frame_queue_next(&is->pictq);
-                    goto retry;
+                    frame_queue_next(&is->pictq); // 如果未显示的第二帧都错过了，就直接丢掉
+                    goto retry;  // 如果有很多帧都错过了，会快速都丢掉
                 }
             }
 
@@ -2180,7 +2317,7 @@ static void video_refresh(void *opaque, double *remaining_time)
                 }
             }
 
-            frame_queue_next(&is->pictq);
+            frame_queue_next(&is->pictq); // 第一次把 rindex_shown = 1；后面把 rindex 这一帧pop出去，rindex_shown一直为1
             is->force_refresh = 1;
 
             if (is->step && !is->paused)
@@ -2188,7 +2325,7 @@ static void video_refresh(void *opaque, double *remaining_time)
         }
     display:
         /* display picture */
-        if (!display_disable && is->force_refresh && is->show_mode == SHOW_MODE_VIDEO && is->pictq.rindex_shown) {
+        if (!display_disable && is->force_refresh && is->show_mode == SHOW_MODE_VIDEO && is->pictq.rindex_shown) { // 先置shown，再渲染
             video_display(is);
         }
     }
@@ -2491,7 +2628,7 @@ fail:
     return ret;
 }
 
-static int configure_audio_filters(VideoState *is, const char *afilters, int force_output_format)
+static int configure_audio_filters(VideoState *is, const char *audio_filters, int force_output_format)
 {
     static const enum AVSampleFormat sample_fmts[] = {AV_SAMPLE_FMT_S16, AV_SAMPLE_FMT_NONE};
     int sample_rates[2] = {0, -1};
@@ -2541,6 +2678,7 @@ static int configure_audio_filters(VideoState *is, const char *afilters, int for
 
     if (force_output_format)
     {
+        av_log(NULL, AV_LOG_INFO, "vs_index: %d, is->audio_tgt.freq: %d\n", is->vs_index, is->audio_tgt.freq);
         sample_rates[0] = is->audio_tgt.freq;
         if ((ret = av_opt_set_int(filt_asink, "all_channel_counts", 0, AV_OPT_SEARCH_CHILDREN)) < 0)
             goto end;
@@ -2550,7 +2688,7 @@ static int configure_audio_filters(VideoState *is, const char *afilters, int for
             goto end;
     }
 
-    if ((ret = configure_filtergraph(is->agraph, afilters, filt_asrc, filt_asink)) < 0)
+    if ((ret = configure_filtergraph(is->agraph, audio_filters, filt_asrc, filt_asink)) < 0)
         goto end;
 
     is->in_audio_filter = filt_asrc;
@@ -2571,26 +2709,33 @@ static int audio_thread(void *arg)
     AVFrame *frame = av_frame_alloc();
     Frame *af;
 #if CONFIG_AVFILTER
+#ifndef PREVENT_DEFAULT_AUDIO_AVFILTER
     int last_serial = -1;
     int reconfigure;
+#endif
 #endif
     int got_frame = 0;
     AVRational tb;
     int ret = 0;
+    av_log(NULL, AV_LOG_INFO, "vs_index: %d, audio thread begin.\n", is->vs_index);
 
     if (!frame)
         return AVERROR(ENOMEM);
 
     do
     {
-        if ((got_frame = decoder_decode_frame(&is->auddec, frame, NULL)) < 0)
+        if ((got_frame = decoder_decode_frame(&is->auddec, frame, NULL)) < 0){
+            av_log(NULL, AV_LOG_INFO, "audio_thread. vs_index: %d, got_frame: %d\n", is->vs_index, got_frame);
             goto the_end;
+        }
+        // av_log(NULL, AV_LOG_INFO, "audio_thread. vs_index: %d, got_frame: %d, frame sample_rate: %d\n", is->vs_index, got_frame, frame->sample_rate);
 
         if (got_frame)
         {
             tb = (AVRational){1, frame->sample_rate};
 
 #if CONFIG_AVFILTER
+#ifndef PREVENT_DEFAULT_AUDIO_AVFILTER
             reconfigure =
                 cmp_audio_fmts(is->audio_filter_src.fmt, is->audio_filter_src.ch_layout.nb_channels,
                                frame->format, frame->ch_layout.nb_channels) ||
@@ -2603,7 +2748,7 @@ static int audio_thread(void *arg)
                 char buf1[1024], buf2[1024];
                 av_channel_layout_describe(&is->audio_filter_src.ch_layout, buf1, sizeof(buf1));
                 av_channel_layout_describe(&frame->ch_layout, buf2, sizeof(buf2));
-                av_log(NULL, AV_LOG_DEBUG,
+                av_log(NULL, AV_LOG_INFO,
                        "Audio frame changed from rate:%d ch:%d fmt:%s layout:%s serial:%d to rate:%d ch:%d fmt:%s layout:%s serial:%d\n",
                        is->audio_filter_src.freq, is->audio_filter_src.ch_layout.nb_channels, av_get_sample_fmt_name(is->audio_filter_src.fmt), buf1, last_serial,
                        frame->sample_rate, frame->ch_layout.nb_channels, av_get_sample_fmt_name(frame->format), buf2, is->auddec.pkt_serial);
@@ -2615,8 +2760,10 @@ static int audio_thread(void *arg)
                 is->audio_filter_src.freq = frame->sample_rate;
                 last_serial = is->auddec.pkt_serial;
 
-                if ((ret = configure_audio_filters(is, afilters, 1)) < 0)
+                if ((ret = configure_audio_filters(is, is->afilters, 0)) < 0) {
+                    av_log(NULL, AV_LOG_INFO, "configure_audio_filters failed, ret: %d\n", ret);
                     goto the_end;
+                }
             }
 
             if ((ret = av_buffersrc_add_frame(is->in_audio_filter, frame)) < 0)
@@ -2625,6 +2772,7 @@ static int audio_thread(void *arg)
             while ((ret = av_buffersink_get_frame_flags(is->out_audio_filter, frame, 0)) >= 0)
             {
                 tb = av_buffersink_get_time_base(is->out_audio_filter);
+#endif
 #endif
                 if (!(af = frame_queue_peek_writable(&is->sampq)))
                     goto the_end;
@@ -2635,23 +2783,28 @@ static int audio_thread(void *arg)
                 af->duration = av_q2d((AVRational){frame->nb_samples, frame->sample_rate});
 
                 av_frame_move_ref(af->frame, frame);
+                // av_log(NULL, AV_LOG_INFO, "audio_thread. vs_index: %d, frame_queue_push\n", is->vs_index);
                 frame_queue_push(&is->sampq);
 
 #if CONFIG_AVFILTER
+#ifndef PREVENT_DEFAULT_AUDIO_AVFILTER
                 if (is->audioq.serial != is->auddec.pkt_serial)
                     break;
             }
             if (ret == AVERROR_EOF)
                 is->auddec.finished = is->auddec.pkt_serial;
 #endif
+#endif
         }
     } while (ret >= 0 || ret == AVERROR(EAGAIN) || ret == AVERROR_EOF);
 the_end:
 #if CONFIG_AVFILTER
+#ifndef PREVENT_DEFAULT_AUDIO_AVFILTER
     avfilter_graph_free(&is->agraph);
 #endif
+#endif
     av_frame_free(&frame);
-    av_log(NULL, AV_LOG_INFO, "audio thread end.");
+    av_log(NULL, AV_LOG_INFO, "vs_index: %d, audio thread end.\n", is->vs_index);
     return ret;
 }
 
@@ -2701,7 +2854,7 @@ static int video_thread(void *arg)
 #if CONFIG_AVFILTER
         if (last_w != frame->width || last_h != frame->height || last_format != frame->format || last_serial != is->viddec.pkt_serial || last_vfilter_idx != is->vfilter_idx)
         {
-            av_log(NULL, AV_LOG_DEBUG,
+            av_log(NULL, AV_LOG_INFO,
                    "Video frame changed from size:%dx%d format:%s serial:%d to size:%dx%d format:%s serial:%d\n",
                    last_w, last_h,
                    (const char *)av_x_if_null(av_get_pix_fmt_name(last_format), "none"), last_serial,
@@ -2718,6 +2871,7 @@ static int video_thread(void *arg)
             if ((ret = configure_video_filters(graph, is, vfilters_list ? vfilters_list[is->vfilter_idx] : NULL, frame)) < 0)
             {
                 SDL_Event event;
+                av_log(NULL, AV_LOG_FATAL, "configure_video_filters: %d. QUIT\n", ret);
                 event.type = FF_QUIT_EVENT;
                 event.user.data1 = is;
                 SDL_PushEvent(&event);
@@ -2759,6 +2913,16 @@ static int video_thread(void *arg)
             pts = (frame->pts == AV_NOPTS_VALUE) ? NAN : frame->pts * av_q2d(tb);
             ret = queue_picture(is, frame, pts, duration, frame->pkt_pos, is->viddec.pkt_serial);
             av_frame_unref(frame);
+            if (ret >= 0 && E_PLAY_STATE_OPENING == is->play_state)
+            {
+                if (is->hibernate) {
+                    if (!is->paused)
+                        stream_toggle_pause(is);
+                    is->play_state = E_PLAY_STATE_HIBERNATION;
+                } else {
+                    is->play_state = E_PLAY_STATE_PLAYING;
+                }
+            }
 #if CONFIG_AVFILTER
             if (is->videoq.serial != is->viddec.pkt_serial)
                 break;
@@ -2912,20 +3076,22 @@ static int audio_decode_frame(VideoState *is)
         while (frame_queue_nb_remaining(&is->sampq) == 0)
         {
             if ((av_gettime_relative() - audio_callback_time) > 1000000LL * is->audio_hw_buf_size / is->audio_tgt.bytes_per_sec / 2)
-                return -1;
+                return -2;
             av_usleep(1000);
         }
 #endif
         if (!(af = frame_queue_peek_readable(&is->sampq)))
-            return -1;
+            return -3;
+        // av_log(NULL, AV_LOG_INFO, "audio_decode_frame. frame_queue_next\n");
         frame_queue_next(&is->sampq);
     } while (af->serial != is->audioq.serial);
 
     data_size = av_samples_get_buffer_size(NULL, af->frame->ch_layout.nb_channels,
                                            af->frame->nb_samples,
                                            af->frame->format, 1);
-
+    // av_log(NULL, AV_LOG_INFO, "audio_decode_frame. data_size: %d, nb_samples: %d\n", data_size, af->frame->nb_samples);
     wanted_nb_samples = synchronize_audio(is, af->frame->nb_samples);
+    // av_log(NULL, AV_LOG_INFO, "wanted_nb_samples: %d\n", wanted_nb_samples);
 
     if (af->frame->format != is->audio_src.fmt ||
         av_channel_layout_compare(&af->frame->ch_layout, &is->audio_src.ch_layout) ||
@@ -2944,10 +3110,10 @@ static int audio_decode_frame(VideoState *is)
                    af->frame->sample_rate, av_get_sample_fmt_name(af->frame->format), af->frame->ch_layout.nb_channels,
                    is->audio_tgt.freq, av_get_sample_fmt_name(is->audio_tgt.fmt), is->audio_tgt.ch_layout.nb_channels);
             swr_free(&is->swr_ctx);
-            return -1;
+            return -4;
         }
         if (av_channel_layout_copy(&is->audio_src.ch_layout, &af->frame->ch_layout) < 0)
-            return -1;
+            return -5;
         is->audio_src.freq = af->frame->sample_rate;
         is->audio_src.fmt = af->frame->format;
     }
@@ -2962,7 +3128,7 @@ static int audio_decode_frame(VideoState *is)
         if (out_size < 0)
         {
             av_log(NULL, AV_LOG_ERROR, "av_samples_get_buffer_size() failed\n");
-            return -1;
+            return -6;
         }
         if (wanted_nb_samples != af->frame->nb_samples)
         {
@@ -2970,7 +3136,7 @@ static int audio_decode_frame(VideoState *is)
                                      wanted_nb_samples * is->audio_tgt.freq / af->frame->sample_rate) < 0)
             {
                 av_log(NULL, AV_LOG_ERROR, "swr_set_compensation() failed\n");
-                return -1;
+                return -7;
             }
         }
         av_fast_malloc(&is->audio_buf1, &is->audio_buf1_size, out_size);
@@ -2980,7 +3146,7 @@ static int audio_decode_frame(VideoState *is)
         if (len2 < 0)
         {
             av_log(NULL, AV_LOG_ERROR, "swr_convert() failed\n");
-            return -1;
+            return -8;
         }
         if (len2 == out_count)
         {
@@ -3021,11 +3187,12 @@ static void sdl_audio_callback(void *opaque, Uint8 *stream, int len)
 {
     VideoState *is = opaque;
     int audio_size, len1;
-
+    // av_log(NULL, AV_LOG_INFO, "sdl_audio_callback. vs_index: %d, len: %d\n", is->vs_index, len);
     audio_callback_time = av_gettime_relative();
 
     while (len > 0)
     {
+        // av_log(NULL, AV_LOG_INFO, "sdl_audio_callback. vs_index: %d, audio_buf_index: %d, audio_buf_size: %d\n", is->vs_index, is->audio_buf_index, is->audio_buf_size);
         if (is->audio_buf_index >= is->audio_buf_size)
         {
             audio_size = audio_decode_frame(is);
@@ -3042,8 +3209,10 @@ static void sdl_audio_callback(void *opaque, Uint8 *stream, int len)
                 is->audio_buf_size = audio_size;
             }
             is->audio_buf_index = 0;
+            // av_log(NULL, AV_LOG_INFO, "sdl_audio_callback. vs_index: %d, audio_size: %d\n", is->vs_index, audio_size);
         }
         len1 = is->audio_buf_size - is->audio_buf_index;
+        // av_log(NULL, AV_LOG_INFO, "sdl_audio_callback. vs_index: %d, len1: %d\n", is->vs_index, len1);
         if (len1 > len)
             len1 = len;
         if (!is->muted && is->audio_buf && is->audio_volume == SDL_MIX_MAXVOLUME)
@@ -3077,6 +3246,7 @@ static int audio_open(void *opaque, AVChannelLayout *wanted_channel_layout, int 
     int wanted_nb_channels = wanted_channel_layout->nb_channels;
 
     env = SDL_getenv("SDL_AUDIO_CHANNELS");
+    // av_log(NULL, AV_LOG_INFO, "audio_open. vs_index: %d. env is NULL: %d\n", ((VideoState*)opaque)->vs_index, env ? false : true);
     if (env)
     {
         wanted_nb_channels = atoi(env);
@@ -3105,6 +3275,7 @@ static int audio_open(void *opaque, AVChannelLayout *wanted_channel_layout, int 
     wanted_spec.userdata = opaque;
     while (!(audio_dev = SDL_OpenAudioDevice(NULL, 0, &wanted_spec, &spec, SDL_AUDIO_ALLOW_FREQUENCY_CHANGE | SDL_AUDIO_ALLOW_CHANNELS_CHANGE)))
     {
+        av_log(NULL, AV_LOG_INFO, "audio_open. OpenAudioDevice failed.\n");
         av_log(NULL, AV_LOG_WARNING, "SDL_OpenAudio (%d channels, %d Hz): %s\n",
                wanted_spec.channels, wanted_spec.freq, SDL_GetError());
         wanted_spec.channels = next_nb_channels[FFMIN(7, wanted_spec.channels)];
@@ -3121,6 +3292,7 @@ static int audio_open(void *opaque, AVChannelLayout *wanted_channel_layout, int 
         }
         av_channel_layout_default(wanted_channel_layout, wanted_spec.channels);
     }
+    av_log(NULL, AV_LOG_INFO, "audio_open. vs_index: %d. OpenAudioDevice successfully.\n", ((VideoState *)opaque)->vs_index);
     if (spec.format != AUDIO_S16SYS)
     {
         av_log(NULL, AV_LOG_ERROR,
@@ -3153,6 +3325,76 @@ static int audio_open(void *opaque, AVChannelLayout *wanted_channel_layout, int 
     return spec.size;
 }
 
+static int stream_audio_open(VideoState *is, AVCodecContext *avctx)
+{
+    int sample_rate;
+    AVChannelLayout ch_layout = {0};
+    int ret = 0;
+#if CONFIG_AVFILTER
+#ifndef PREVENT_DEFAULT_AUDIO_AVFILTER
+    {
+        AVFilterContext *sink;
+
+        is->audio_filter_src.freq = avctx->sample_rate;
+        ret = av_channel_layout_copy(&is->audio_filter_src.ch_layout, &avctx->ch_layout);
+        if (ret < 0)
+            goto fail;
+        is->audio_filter_src.fmt = avctx->sample_fmt;
+        if ((ret = configure_audio_filters(is, is->afilters, 0)) < 0)
+            goto fail;
+        sink = is->out_audio_filter;
+        sample_rate = av_buffersink_get_sample_rate(sink);
+        ret = av_buffersink_get_ch_layout(sink, &ch_layout);
+        if (ret < 0)
+            goto fail;
+    }
+#endif
+#else
+    if (!is->hibernate)
+    {
+        sample_rate = avctx->sample_rate;
+        ret = av_channel_layout_copy(&ch_layout, &avctx->ch_layout);
+        if (ret < 0){
+            av_log(NULL, AV_LOG_INFO, "stream_audio_open. av_channel_layout_copy: %d\n", ret);
+            goto fail;
+        }
+    }
+#endif
+    if (!is->hibernate)
+    {
+        /* prepare audio output */
+        if ((ret = audio_open(is, &ch_layout, sample_rate, &is->audio_tgt)) < 0) {
+            av_log(NULL, AV_LOG_INFO, "stream_audio_open. audio_open: %d\n", ret);
+            goto fail;
+        }
+        is->audio_hw_buf_size = ret;
+        is->audio_src = is->audio_tgt;
+        is->audio_buf_size = 0;
+        is->audio_buf_index = 0;
+
+        /* init averaging filter */
+        is->audio_diff_avg_coef = exp(log(0.01) / AUDIO_DIFF_AVG_NB);
+        is->audio_diff_avg_count = 0;
+        /* since we do not have a precise anough audio FIFO fullness,
+            we correct audio sync only if larger than this threshold */
+        is->audio_diff_threshold = (double)(is->audio_hw_buf_size) / is->audio_tgt.bytes_per_sec;
+    }
+fail:
+    // avcodec_free_context(&avctx);
+/* out: */
+    av_channel_layout_uninit(&ch_layout);
+    return ret;
+}
+
+static void stream_audio_resume(VideoState *is)
+{
+    if (!is->hibernate) {
+        av_log(NULL, AV_LOG_INFO, "stream_audio_resume. vs_index: %d, SDL_PauseAudioDevice: 0\n", is->vs_index);
+        SDL_PauseAudioDevice(audio_dev, 0); // OpenAudioDevice 默认是 Pause 状态的，这里 resume
+    }
+    return ;
+}
+
 /* open a given stream. Return 0 if OK */
 static int stream_component_open(VideoState *is, int stream_index)
 {
@@ -3162,7 +3404,7 @@ static int stream_component_open(VideoState *is, int stream_index)
     const char *forced_codec_name = NULL;
     AVDictionary *opts = NULL;
     const AVDictionaryEntry *t = NULL;
-    int sample_rate;
+    /* int sample_rate; */
     AVChannelLayout ch_layout = {0};
     int ret = 0;
     int stream_lowres = lowres;
@@ -3243,44 +3485,9 @@ static int stream_component_open(VideoState *is, int stream_index)
     switch (avctx->codec_type)
     {
     case AVMEDIA_TYPE_AUDIO:
-#if CONFIG_AVFILTER
-    {
-        AVFilterContext *sink;
-
-        is->audio_filter_src.freq = avctx->sample_rate;
-        ret = av_channel_layout_copy(&is->audio_filter_src.ch_layout, &avctx->ch_layout);
-        if (ret < 0)
+        if (stream_audio_open(is, avctx) < 0) {
             goto fail;
-        is->audio_filter_src.fmt = avctx->sample_fmt;
-        if ((ret = configure_audio_filters(is, afilters, 0)) < 0)
-            goto fail;
-        sink = is->out_audio_filter;
-        sample_rate = av_buffersink_get_sample_rate(sink);
-        ret = av_buffersink_get_ch_layout(sink, &ch_layout);
-        if (ret < 0)
-            goto fail;
-    }
-#else
-        sample_rate = avctx->sample_rate;
-        ret = av_channel_layout_copy(&ch_layout, &avctx->ch_layout);
-        if (ret < 0)
-            goto fail;
-#endif
-        /* prepare audio output */
-        if ((ret = audio_open(is, &ch_layout, sample_rate, &is->audio_tgt)) < 0)
-            goto fail;
-        is->audio_hw_buf_size = ret;
-        is->audio_src = is->audio_tgt;
-        is->audio_buf_size = 0;
-        is->audio_buf_index = 0;
-
-        /* init averaging filter */
-        is->audio_diff_avg_coef = exp(log(0.01) / AUDIO_DIFF_AVG_NB);
-        is->audio_diff_avg_count = 0;
-        /* since we do not have a precise anough audio FIFO fullness,
-            we correct audio sync only if larger than this threshold */
-        is->audio_diff_threshold = (double)(is->audio_hw_buf_size) / is->audio_tgt.bytes_per_sec;
-
+        }
         is->audio_stream = stream_index;
         is->audio_st = ic->streams[stream_index];
 
@@ -3293,7 +3500,7 @@ static int stream_component_open(VideoState *is, int stream_index)
         }
         if ((ret = decoder_start(&is->auddec, audio_thread, "audio_decoder", is)) < 0)
             goto out;
-        SDL_PauseAudioDevice(audio_dev, 0);  // OpenAudioDevice 默认是 Pause 状态的，这里 resume
+        stream_audio_resume(is);
         break;
     case AVMEDIA_TYPE_VIDEO:
         is->video_stream = stream_index;
@@ -3366,6 +3573,8 @@ static int read_thread(void *arg)
     SDL_mutex *wait_mutex = SDL_CreateMutex();
     int scan_all_pmts_set = 0;
     int64_t pkt_ts;
+    av_log(NULL, AV_LOG_INFO, "read_thread.\n");
+    av_log(NULL, AV_LOG_INFO, "read thread id (NDK): %ld\n", syscall(SYS_gettid));
 
     if (!wait_mutex)
     {
@@ -3398,6 +3607,11 @@ static int read_thread(void *arg)
         av_dict_set(&format_opts, "scan_all_pmts", "1", AV_DICT_DONT_OVERWRITE);
         scan_all_pmts_set = 1;
     }
+    AVDictionary *options = NULL;
+    av_dict_set(&options, "reconnect", "1", 0);  // 自动重连
+    av_dict_set(&options, "reconnect_streamed", "1", 0);  // 流媒体自动重连
+    av_dict_set(&options, "reconnect_delay_max", "5", 0); // 每次重连之间最大延迟时间（秒）
+    av_dict_set(&options, "timeout", "5000000", 0);       // 连接和读写IO超时时间（微秒）建议设置为 5000000（5 秒），避免网络卡死，FFmpeg 默认会等待较久，设置超时能让你快速退出并重试。适用于网络状况不稳定的环境（如移动网络、热点）
     err = avformat_open_input(&ic, is->filename, is->iformat, &format_opts);
     if (err < 0)
     {
@@ -3542,8 +3756,7 @@ static int read_thread(void *arg)
 
     if (is->video_stream < 0 && is->audio_stream < 0)
     {
-        av_log(NULL, AV_LOG_FATAL, "Failed to open file '%s' or configure filtergraph\n",
-               is->filename);
+        av_log(NULL, AV_LOG_FATAL, "Failed to open file '%s' or configure filtergraph\n", is->filename);
         ret = -1;
         goto fail;
     }
@@ -3615,8 +3828,10 @@ static int read_thread(void *arg)
         {
             if (is->video_st && is->video_st->disposition & AV_DISPOSITION_ATTACHED_PIC)
             {
-                if ((ret = av_packet_ref(pkt, &is->video_st->attached_pic)) < 0)
+                if ((ret = av_packet_ref(pkt, &is->video_st->attached_pic)) < 0) {
+                    av_log(NULL, AV_LOG_FATAL, "av_packet_ref: %d. goto fail.\n", ret);
                     goto fail;
+                }
                 packet_queue_put(&is->videoq, pkt);
                 packet_queue_put_nullpacket(&is->videoq, pkt, is->video_stream);
             }
@@ -3646,12 +3861,15 @@ static int read_thread(void *arg)
             else if (autoexit)
             {
                 ret = AVERROR_EOF;
+                av_log(NULL, AV_LOG_FATAL, "autoexit. goto fail.\n");
                 goto fail;
             }
         }
         ret = av_read_frame(ic, pkt);
         if (ret < 0)
         {
+            if (AVERROR_EOF != ret)
+                av_log(NULL, AV_LOG_INFO, "read_thread. av_read_frame: %s\n", av_err2str(ret));
             // 解封装到 End of file后这里会循环。如果设置了autoexit，渲染结束后自动退出线程。
             // av_log(NULL, AV_LOG_INFO, "av_read_frame ret:%d, %s\n", ret, av_err2str(ret));
             if ((ret == AVERROR_EOF || avio_feof(ic->pb)) && !is->eof)
@@ -3666,6 +3884,7 @@ static int read_thread(void *arg)
             }
             if (ic->pb && ic->pb->error)
             {
+                av_log(NULL, AV_LOG_INFO, "read_thread. pb->error: %d, %s\n", ic->pb->error, av_err2str(ic->pb->error));
                 if (autoexit)
                     goto fail;
                 else
@@ -3704,6 +3923,7 @@ static int read_thread(void *arg)
         {
             av_packet_unref(pkt);
         }
+
     }
 
     ret = 0;
@@ -3715,7 +3935,7 @@ fail:
     if (ret != 0)
     {
         SDL_Event event;
-
+        av_log(NULL, AV_LOG_FATAL, "read_thread fail, QUIT.\n");
         event.type = FF_QUIT_EVENT;
         event.user.data1 = is;
         SDL_PushEvent(&event);
@@ -3738,6 +3958,7 @@ static int stream_open(VideoState *is /*, const char *filename , const AVInputFo
     //is = av_mallocz(sizeof(VideoState));
     if (!is)
         return -1;
+    is->play_state = E_PLAY_STATE_OPENING;
     is->last_video_stream = is->video_stream = -1;
     is->last_audio_stream = is->audio_stream = -1;
     is->last_subtitle_stream = is->subtitle_stream = -1;
@@ -3749,9 +3970,6 @@ static int stream_open(VideoState *is /*, const char *filename , const AVInputFo
     is->xleft = 0;
     is->video_frame_rendered = 0;
     is->need_refresh_pos = 0;
-    is->last_x = 0.0;
-    is->last_y = 0.0;
-    is->last_time = 0;
 
     /* start video display */
     if (frame_queue_init(&is->pictq, &is->videoq, VIDEO_PICTURE_QUEUE_SIZE, 1) < 0)
@@ -3791,8 +4009,10 @@ static int stream_open(VideoState *is /*, const char *filename , const AVInputFo
         av_log(NULL, AV_LOG_FATAL, "SDL_CreateThread(): %s\n", SDL_GetError());
     fail:
         stream_close(is);
+        is->play_state = E_PLAY_STATE_FAILED;
         return -2;
     }
+    av_log(NULL, AV_LOG_INFO, "vs_index: %d. read_tid SDL thread id: %lu\n", is->vs_index, SDL_GetThreadID(is->read_tid));
     return 0;
 }
 
@@ -3906,7 +4126,7 @@ static void toggle_audio_display(VideoState *is)
 
 static void refresh_loop_wait_event(VideoState *is, SDL_Event *event)
 {
-    double remaining_time = 0.0;
+    double remaining_time = 0.0;  // 每次循环的sleep时间，单位是秒
     SDL_PumpEvents();
     while (!SDL_PeepEvents(event, 1, SDL_GETEVENT, SDL_FIRSTEVENT, SDL_LASTEVENT))
     {
@@ -3917,13 +4137,13 @@ static void refresh_loop_wait_event(VideoState *is, SDL_Event *event)
         }
         if (remaining_time > 0.0)
             av_usleep((int64_t)(remaining_time * 1000000.0));
-        remaining_time = REFRESH_RATE;
+        remaining_time = REFRESH_RATE; // 如果没有调video_refresh更新它的值，也至少保证 sleep 5毫秒
 
-        // if (!is->video_frame_rendered)
+        // bool allow_slip_up = (is->next) ? true : false, allow_slip_down = (is->prev) ? true : false;
 
         int is_on_now = atomic_load(&touch_on);
         int is_on_last = atomic_load(&touch_on_last);
-        /* if ((touch_move_xy[0] != 0.0 || touch_move_xy[1] != 0.0) || (touch_move_xy[0] == 0.0 && touch_move_xy[1] == 0.0 && (is->last_x != 0.0 || is->last_y != 0.0))) */
+        /* if ((touch_move_xy[0] != 0.0 || touch_move_xy[1] != 0.0) || (touch_move_xy[0] == 0.0 && touch_move_xy[1] == 0.0 && (userControl.last_video_xy[0] != 0.0 || userControl.last_video_xy[1] != 0.0))) */
         int s;
         if ((E_SLIDE_OFF != (s = atomic_load(&userControl.slide_state))) || !(!is_on_last && !is_on_now))
         {
@@ -3936,9 +4156,9 @@ static void refresh_loop_wait_event(VideoState *is, SDL_Event *event)
         if (is->show_mode != SHOW_MODE_NONE && (!is->paused || is->force_refresh)) {
             if (!display_disable && g_renderer && /* is->video_frame_rendered > 0 && */ is->need_refresh_pos)
             {
-                if (E_SLIDE_OFF == s &&  (!is_on_last && is_on_now)){
+                if (E_SLIDE_OFF == s && (!is_on_last && is_on_now)){
                     // OFF状态按下
-                    is->touch_down_time = av_gettime();
+                    userControl.touch_down_time = av_gettime();
                     atomic_store(&userControl.slide_state_last_frame, s);
                     atomic_store(&userControl.slide_state, E_SLIDE_FOLLOWING);
                     atomic_store(&touch_on_last, is_on_now);
@@ -3946,35 +4166,45 @@ static void refresh_loop_wait_event(VideoState *is, SDL_Event *event)
                     // 持续被按下
                     float down_x[2] = {atomic_load(&touch_down_xy[0]), atomic_load(&touch_down_xy[1])},
                           move_xy[2] = {atomic_load(&touch_move_xy[0]), atomic_load(&touch_move_xy[1])};
-                    is->current_video_xy[0] = is->last_x = move_xy[0] - down_x[0] + is->press_video_xy[0];
-                    is->current_video_xy[1] = is->last_y = move_xy[1] - down_x[1] + is->press_video_xy[1];
-                    av_log(NULL, AV_LOG_INFO, "E_SLIDE_FOLLOWING. touch_move_xy: [%f, %f], touch_down_xy: [%f, %f], is->press_video_xy: [%f, %f]\n",
-                           move_xy[0], move_xy[1], down_x[0], down_x[1], is->press_video_xy[0], is->press_video_xy[1]);
-                    av_log(NULL, AV_LOG_INFO, "E_SLIDE_FOLLOWING. current_x: %f, current_y: %f\n", is->current_video_xy[0], is->current_video_xy[1]);
+                    userControl.current_video_xy[0] = userControl.last_video_xy[0] = move_xy[0] - down_x[0] + userControl.press_video_xy[0];
+                    userControl.current_video_xy[1] = userControl.last_video_xy[1] = move_xy[1] - down_x[1] + userControl.press_video_xy[1];
+                    /* av_log(NULL, AV_LOG_INFO, "E_SLIDE_FOLLOWING. touch_move_xy: [%f, %f], touch_down_xy: [%f, %f], userControl.press_video_xy: [%f, %f]\n",
+                           move_xy[0], move_xy[1], down_x[0], down_x[1], userControl.press_video_xy[0], userControl.press_video_xy[1]);
+                    av_log(NULL, AV_LOG_INFO, "E_SLIDE_FOLLOWING. current_x: %f, current_y: %f\n", userControl.current_video_xy[0], userControl.current_video_xy[1]); */
                 } else if (E_SLIDE_FOLLOWING == s && (is_on_last && !is_on_now)) {
                     // 松开
-                    is->touch_up_time = av_gettime();
+                    userControl.touch_up_time = av_gettime();
                     // 记录松开时视频的坐标
-                    is->release_video_xy[0] = is->current_video_xy[0];
-                    is->release_video_xy[1] = is->current_video_xy[1];
+                    userControl.release_video_xy[0] = userControl.current_video_xy[0];
+                    userControl.release_video_xy[1] = userControl.current_video_xy[1];
                     // 计算本次视频滑动的距离
-                    // float distance = sqrt(pow(is->press_video_xy[0] - is->release_video_xy[0], 2.0) + pow(is->press_video_xy[1] - is->release_video_xy[1], 2.0));
-                    float distance = sqrt(pow(is->release_video_xy[0], 2.0) + pow(is->release_video_xy[1], 2.0));
+                    // float distance = sqrt(pow(userControl.press_video_xy[0] - userControl.release_video_xy[0], 2.0) + pow(userControl.press_video_xy[1] - userControl.release_video_xy[1], 2.0));
+                    float distance = sqrt(pow(userControl.release_video_xy[0], 2.0) + pow(userControl.release_video_xy[1], 2.0));
                     // 计算本次视频滑动持续时间
-                    int64_t slip_time = (is->touch_up_time - is->touch_down_time) / 1000; // ms
+                    int64_t slip_time = (userControl.touch_up_time - userControl.touch_down_time) / 1000; // ms
 
                     /* short distance || medium distance and long time*/
-                    if (distance >= LONG_DISTANCE 
-                        || (E_SLIDE_OFF == atomic_load(&userControl.slide_state_last_frame) 
-                        && distance >= SHORT_DISTANCE && distance <= LONG_DISTANCE && slip_time <= THRESHOLD_TIME) ){
+                    /* 视频如果是从OFF状态进入到FOLLOWING状态，才允许快速滑出。如果是BACK状态按下的，则不允许快速滑出 */
+                    if ( (distance >= LONG_DISTANCE || (E_SLIDE_OFF == atomic_load(&userControl.slide_state_last_frame) && distance >= SHORT_DISTANCE && distance <= LONG_DISTANCE && slip_time <= THRESHOLD_TIME)))
+                    {
                         atomic_store(&userControl.slide_state_last_frame, s);
-                        atomic_store(&userControl.slide_state, E_SLIDE_SLIP_OUT);
+                        if (is->next && userControl.release_video_xy[1] < 0)
+                            atomic_store(&userControl.slide_state, E_SLIDE_SLIP_OUT_UP);
+                        else if (is->prev && userControl.release_video_xy[1] > 0)
+                            atomic_store(&userControl.slide_state, E_SLIDE_SLIP_OUT_DOWN);
+                        else
+                            atomic_store(&userControl.slide_state, E_SLIDE_BACK);
+                        if (distance >= SHORT_DISTANCE && distance <= LONG_DISTANCE && slip_time <= THRESHOLD_TIME)
+                        {
+                            userControl.slip_initial_speed[0] = slip_time ? fabsf(userControl.release_video_xy[0]) / slip_time : 0.0;
+                            userControl.slip_initial_speed[1] = slip_time ? fabsf(userControl.release_video_xy[1]) / slip_time : 0.0;
+                        }
                     }
                     else{
                         atomic_store(&userControl.slide_state_last_frame, s);                        
                         atomic_store(&userControl.slide_state, E_SLIDE_BACK);
                     }
-                    is->last_time = is->touch_up_time;
+                    userControl.last_time = userControl.touch_up_time;
                     atomic_store(&touch_on_last, is_on_now);
                 }
                 else if (E_SLIDE_BACK == s)
@@ -3983,10 +4213,10 @@ static void refresh_loop_wait_event(VideoState *is, SDL_Event *event)
                     /* 未完成时按下 */
                     if (!is_on_last && is_on_now )
                     {
-                        is->touch_down_time = this_time;
-                        is->press_video_xy[0] = is->current_video_xy[0];
-                        is->press_video_xy[1] = is->current_video_xy[1];
-                        av_log(NULL, AV_LOG_INFO, "when E_SLIDE_BACK, touch on. is->press_video_xy: [%f, %f]", is->press_video_xy[0], is->press_video_xy[1]);
+                        userControl.touch_down_time = this_time;
+                        userControl.press_video_xy[0] = userControl.current_video_xy[0];
+                        userControl.press_video_xy[1] = userControl.current_video_xy[1];
+                        av_log(NULL, AV_LOG_INFO, "when E_SLIDE_BACK, touch on. userControl.press_video_xy: [%f, %f]", userControl.press_video_xy[0], userControl.press_video_xy[1]);
                         atomic_store(&userControl.slide_state_last_frame, s);
                         atomic_store(&userControl.slide_state, E_SLIDE_FOLLOWING);
                         atomic_store(&touch_on_last, is_on_now);
@@ -3994,71 +4224,77 @@ static void refresh_loop_wait_event(VideoState *is, SDL_Event *event)
                     else 
                     {
                         float diff_time;
-                        if (is->last_time != 0)
-                            diff_time = (float)(this_time - is->last_time) / 1000;
+                        if (userControl.last_time != 0)
+                            diff_time = (float)(this_time - userControl.last_time) / 1000;
                         else
                             diff_time = 25.0;
                         // float current_x, current_y;
-                        speedSmoothMove(diff_time, is->last_x, is->last_y,
-                                        (float)is->release_video_xy[0], (float)is->release_video_xy[1],
+                        speedSmoothMove(diff_time, userControl.last_video_xy[0], userControl.last_video_xy[1],
+                                        (float)userControl.release_video_xy[0], (float)userControl.release_video_xy[1],
                                         0.0, 0.0,
                                         0.2, 0.2,
-                                        &is->current_video_xy[0], &is->current_video_xy[1]);
-                        av_log(NULL, AV_LOG_INFO, "E_SLIDE_BACK. diff_time: %f, current_x: %f, current_y: %f\n",
+                                        &userControl.current_video_xy[0], &userControl.current_video_xy[1]);
+                        /* av_log(NULL, AV_LOG_INFO, "E_SLIDE_BACK. diff_time: %f, current_x: %f, current_y: %f\n",
                                diff_time,
-                               is->current_video_xy[0], is->current_video_xy[1]);
+                               is->current_video_xy[0], is->current_video_xy[1]); */
                         /* SDL_SetVertexPositionOffset(g_renderer,
-                                                    is->last_x = current_x,
-                                                    is->last_y = current_y); */
-                        // atomic_store(&rect_offset_x, is->last_x = current_x);
-                        // atomic_store(&rect_offset_y, is->last_y = current_y);
-                        is->last_x = is->current_video_xy[0];
-                        is->last_y = is->current_video_xy[1];
-                        is->last_time = this_time;
-                        if (0.0 == is->current_video_xy[0] && 0.0 == is->current_video_xy[1]) {
-                            is->press_video_xy[0] = 0.0;
-                            is->press_video_xy[1] = 0.0;
+                                                    userControl.last_video_xy[0] = current_x,
+                                                    userControl.last_video_xy[1] = current_y); */
+                        // atomic_store(&rect_offset_x, userControl.last_video_xy[0] = current_x);
+                        // atomic_store(&rect_offset_y, userControl.last_video_xy[1] = current_y);
+                        userControl.last_video_xy[0] = userControl.current_video_xy[0];
+                        userControl.last_video_xy[1] = userControl.current_video_xy[1];
+                        userControl.last_time = this_time;
+                        if (0.0 == userControl.current_video_xy[0] && 0.0 == userControl.current_video_xy[1])
+                        {
+                            userControl.press_video_xy[0] = 0.0;
+                            userControl.press_video_xy[1] = 0.0;
                             atomic_store(&userControl.slide_state_last_frame, s);
                             atomic_store(&userControl.slide_state, E_SLIDE_OFF);
                         }
                         atomic_store(&touch_on_last, is_on_now);
                     }
                 }
-                else if (E_SLIDE_SLIP_OUT == s)
+                else if (E_SLIDE_SLIP_OUT_UP == s || E_SLIDE_SLIP_OUT_DOWN == s)
                 {
                     int64_t this_time = av_gettime();
                     /* 未完成时按下 */
                     if (!is_on_last && is_on_now)
                     {
-                        is->touch_down_time = this_time;
-                        is->press_video_xy[0] = is->current_video_xy[0];
-                        is->press_video_xy[1] = is->current_video_xy[1];
-                        av_log(NULL, AV_LOG_INFO, "when E_SLIDE_SLIP_OUT, touch on. is->press_video_xy: [%f, %f]", is->press_video_xy[0], is->press_video_xy[1]);
+                        userControl.touch_down_time = this_time;
+                        userControl.press_video_xy[0] = userControl.current_video_xy[0];
+                        userControl.press_video_xy[1] = userControl.current_video_xy[1];
+                        av_log(NULL, AV_LOG_INFO, "when E_SLIDE_SLIP_OUT_UP, touch on. userControl.press_video_xy: [%f, %f]", userControl.press_video_xy[0], userControl.press_video_xy[1]);
                         atomic_store(&userControl.slide_state_last_frame, s);
                         atomic_store(&userControl.slide_state, E_SLIDE_FOLLOWING);
                         atomic_store(&touch_on_last, is_on_now);
                     } else{
                         float diff_time;
-                        diff_time = (float)(this_time - is->last_time) / 1000;
-                        float target_x = 0.0, target_y = -2000.0;
+                        diff_time = (float)(this_time - userControl.last_time) / 1000;
+                        float target_x = 0.0, target_y = 0.0;
+                        if (E_SLIDE_SLIP_OUT_UP == s)
+                            target_y = -screen_height;
+                        else if (E_SLIDE_SLIP_OUT_DOWN == s)
+                            target_y = screen_height;
                         // float current_x, current_y;
                         speedUpMoveOut(diff_time,
-                                       is->last_x, is->last_y,
-                                       (float)is->release_video_xy[0], (float)is->release_video_xy[1],
+                                       userControl.last_video_xy[0], userControl.last_video_xy[1],
+                                       (float)userControl.release_video_xy[0], (float)userControl.release_video_xy[1],
                                        target_x, target_y,
-                                       1.0, &is->current_video_xy[0], &is->current_video_xy[1]);
-                        av_log(NULL, AV_LOG_INFO, "E_SLIDE_SLIP_OUT. diff_time: %f, current_x: %f, current_y: %f\n",
+                                       1.0, &userControl.current_video_xy[0], &userControl.current_video_xy[1],
+                                       userControl.slip_initial_speed[0], userControl.slip_initial_speed[1]);
+                        av_log(NULL, AV_LOG_INFO, "E_SLIDE_SLIP_OUT_UP. diff_time: %f, current_x: %f, current_y: %f\n",
                                diff_time,
-                               is->current_video_xy[0], is->current_video_xy[1]);
+                               userControl.current_video_xy[0], userControl.current_video_xy[1]);
                         /* SDL_SetVertexPositionOffset(g_renderer,
-                                                    is->last_x = current_x,
-                                                    is->last_y = current_y); */
-                        // atomic_store(&rect_offset_x, is->last_x = current_x);
-                        // atomic_store(&rect_offset_y, is->last_y = current_y);
-                        is->last_x = is->current_video_xy[0];
-                        is->last_y = is->current_video_xy[1];
-                        is->last_time = this_time;
-                        if (target_x == is->current_video_xy[0] && target_y == is->current_video_xy[1])
+                                                    userControl.last_video_xy[0] = current_x,
+                                                    userControl.last_video_xy[1] = current_y); */
+                        // atomic_store(&rect_offset_x, userControl.last_video_xy[0] = current_x);
+                        // atomic_store(&rect_offset_y, userControl.last_video_xy[1] = current_y);
+                        userControl.last_video_xy[0] = userControl.current_video_xy[0];
+                        userControl.last_video_xy[1] = userControl.current_video_xy[1];
+                        userControl.last_time = this_time;
+                        if (target_x == userControl.current_video_xy[0] && target_y == userControl.current_video_xy[1])
                         {
                             atomic_store(&userControl.slide_state_last_frame, s);
                             atomic_store(&userControl.slide_state, E_SLIDE_OFF);
@@ -4068,11 +4304,18 @@ static void refresh_loop_wait_event(VideoState *is, SDL_Event *event)
                             atomic_store(&touch_move_xy[1], 0.0);
                             atomic_store(&touch_up_xy[0], 0.0);
                             atomic_store(&touch_up_xy[1], 0.0);
-                            is->press_video_xy[0] = 0.0;
-                            is->press_video_xy[1] = 0.0;
+                            userControl.press_video_xy[0] = 0.0;
+                            userControl.press_video_xy[1] = 0.0;
 
                             SDL_Event event;
-                            event.type = FF_QUIT_EVENT;
+                            if (E_SLIDE_SLIP_OUT_UP == s && is->next)
+                                event.type = FF_TOGGLE_NEXT_EVENT; 
+                            else if (E_SLIDE_SLIP_OUT_DOWN == s && is->prev)
+                                event.type = FF_TOGGLE_PREV_EVENT; 
+                            else {
+                                av_log(NULL, AV_LOG_INFO, "Shoud not slip out. QUIT.\n");
+                                event.type = FF_QUIT_EVENT;
+                            }
                             event.user.data1 = is;
                             SDL_PushEvent(&event);
                         }
@@ -4116,7 +4359,7 @@ static void seek_chapter(VideoState *is, int incr)
 }
 
 /* handle an event sent by the GUI */
-static void event_loop(VideoState *cur_stream)
+static int event_loop(VideoState *cur_stream)
 {
     SDL_Event event;
     double incr, pos, frac;
@@ -4346,24 +4589,177 @@ static void event_loop(VideoState *cur_stream)
             atomic_store(&userControl.slide_state_last_frame, E_SLIDE_OFF);
             // atomic_store(&rect_offset_x, 0);
             // atomic_store(&rect_offset_y, 0);
-            cur_stream->current_video_xy[0] = 0.0;
-            cur_stream->current_video_xy[1] = 0.0;
-            return ;
+            userControl.current_video_xy[0] = 0.0;
+            userControl.current_video_xy[1] = 0.0;
+            return FF_QUIT_EVENT;
             do_exit(cur_stream);
+            break;
+        case FF_TOGGLE_NEXT_EVENT:
+            av_log(NULL, AV_LOG_INFO, "FF_TOGGLE_NEXT_EVENT.\n");
+            atomic_store(&touch_on, 0);
+            atomic_store(&touch_on_last, 0);
+            atomic_store(&userControl.touch_state, true);
+            atomic_store(&userControl.slide_state, E_SLIDE_OFF);
+            atomic_store(&userControl.slide_state_last_frame, E_SLIDE_OFF);
+            // atomic_store(&rect_offset_x, 0);
+            // atomic_store(&rect_offset_y, 0);
+            userControl.current_video_xy[0] = 0.0;
+            userControl.current_video_xy[1] = 0.0;
+            userControl.slip_initial_speed[0] = 0.0;
+            userControl.slip_initial_speed[1] = 0.0;
+            return FF_TOGGLE_NEXT_EVENT;
+            break;
+        case FF_TOGGLE_PREV_EVENT:
+            av_log(NULL, AV_LOG_INFO, "FF_TOGGLE_PREV_EVENT.\n");
+            atomic_store(&touch_on, 0);
+            atomic_store(&touch_on_last, 0);
+            atomic_store(&userControl.touch_state, true);
+            atomic_store(&userControl.slide_state, E_SLIDE_OFF);
+            atomic_store(&userControl.slide_state_last_frame, E_SLIDE_OFF);
+            // atomic_store(&rect_offset_x, 0);
+            // atomic_store(&rect_offset_y, 0);
+            userControl.current_video_xy[0] = 0.0;
+            userControl.current_video_xy[1] = 0.0;
+            userControl.slip_initial_speed[0] = 0.0;
+            userControl.slip_initial_speed[1] = 0.0;
+            return FF_TOGGLE_PREV_EVENT;
             break;
         default:
             break;
         }
-        // liuzhi. Thread should quit.
-        /* if (cur_stream->eof)
-        {
-            do_exit(cur_stream);
-            break;
-        } */
     }
     av_log(NULL, AV_LOG_INFO, "End of event_loop\n");
+    return 0;
 }
 
+static int vs_get_play_state(VideoState *vs) 
+{
+    if (!vs)
+        return -1;
+    return vs->play_state;
+}
+
+static int vs_open(VideoState *vs, int hibernate)
+{
+    av_log(NULL, AV_LOG_INFO, "vs_index: %d. vs_open. current: %d. filename: %s\n", vs->vs_index, vs->current, vs->filename);
+    vs->hibernate = hibernate;
+    int ret = stream_open(vs);
+    return ret;
+}
+
+static void vs_hibernate(VideoState *vs)
+{
+    if (vs)
+    {
+        if (E_PLAY_STATE_OPENING == vs->play_state)
+        {
+            vs->hibernate = 1;
+            av_log(NULL, AV_LOG_INFO, "vs_hibernate. vs_index: %d. play_state is still E_PLAY_STATE_OPENING.\n", vs->vs_index);
+            return ;
+        }
+        else if (E_PLAY_STATE_HIBERNATION == vs->play_state)
+        {
+            return;
+        }
+        else if (E_PLAY_STATE_STOPPING == vs->play_state || E_PLAY_STATE_STOPPED == vs->play_state || E_PLAY_STATE_FAILED == vs->play_state)
+        {
+            av_log(NULL, AV_LOG_INFO, "vs_hibernate. vs_index: %d. Error play_state: %d. Return.\n", vs->vs_index, vs->play_state);
+            return;
+        }
+        av_log(NULL, AV_LOG_INFO, "vs_hibernate. vs_index: %d. Pause and SDL_CloseAudioDevice\n", vs->vs_index);
+        if (!vs->paused)
+            stream_toggle_pause(vs);
+        for (int i = 0; i < vs->ic->nb_streams; i++)
+        {
+            AVStream *st = vs->ic->streams[i];
+            enum AVMediaType type = st->codecpar->codec_type;
+            if (AVMEDIA_TYPE_AUDIO == type) {
+                SDL_CloseAudioDevice(audio_dev);
+                break;
+            }
+        }
+        vs->play_state = E_PLAY_STATE_HIBERNATION;
+    }
+    return;
+}
+
+static void vs_resume(VideoState *vs)
+{
+    if (vs)
+    {
+        if (E_PLAY_STATE_HIBERNATION == vs->play_state)
+        {
+            av_log(NULL, AV_LOG_INFO, "vs_resume. From E_PLAY_STATE_HIBERNATION. vs_index: %d. current: %d. filename: %s\n", vs->vs_index, vs->current, vs->filename);
+            vs->hibernate = 0;
+            for (int i = 0; i < vs->ic->nb_streams; i++)
+            {
+                AVStream *st = vs->ic->streams[i];
+                enum AVMediaType type = st->codecpar->codec_type;
+                if (AVMEDIA_TYPE_AUDIO == type)
+                {
+                    stream_audio_open(vs, vs->auddec.avctx);
+                    stream_audio_resume(vs);
+                    break;
+                }
+            }
+            if (vs->paused)
+                stream_toggle_pause(vs);
+        }
+        else if (E_PLAY_STATE_PAUSE == vs->play_state)
+        {
+            toggle_pause(vs);
+        }
+        vs->play_state = E_PLAY_STATE_PLAYING;
+    }
+    return;
+}
+
+
+static void vs_close(VideoState *vs)
+{
+    av_log(NULL, AV_LOG_INFO, "vs_index: %d. vs_close. current: %d. filename: %s\n", vs->vs_index, vs->current, vs->filename);
+    if (E_PLAY_STATE_STOPPED == vs->play_state)
+    {
+        return ;
+    }
+    vs->play_state = E_PLAY_STATE_STOPPING;
+    if (vs->paused)
+        stream_toggle_pause(vs);
+    stream_close(vs);
+    void *filename = vs->filename;
+    void *prev = vs->prev, *next = vs->next;
+    int v_argc = vs->v_argc;
+    char* *v_argv = vs->v_argv;
+    int vs_index = vs->vs_index;
+    void *v_renderer = vs->v_renderer;
+    int play_state = vs->play_state;
+    int hibernate = vs->hibernate;
+    int current = vs->current;
+    memset(vs, 0, sizeof(VideoState));
+    vs->filename = filename;
+    vs->prev = prev;
+    vs->next = next;
+    vs->v_argc = v_argc;
+    vs->v_argv = v_argv;
+    vs->vs_index = vs_index;
+    vs->v_renderer = v_renderer;
+    vs->play_state = play_state;
+    vs->hibernate = hibernate;
+    vs->current = current;
+
+    vs->play_state = E_PLAY_STATE_STOPPED;
+}
+
+#if 0
+static void vs_pause(VideoState *vs)
+{
+    if(vs) {
+        vs->play_state = E_PLAY_STATE_PAUSE;
+        toggle_pause(vs);
+    }
+    return;
+}
+#endif
 static int opt_width(void *optctx, const char *opt, const char *arg)
 {
     screen_width = parse_number_or_die(opt, arg, OPT_INT64, 1, INT_MAX);
@@ -4621,7 +5017,7 @@ void SDLSetting() {
         av_log(NULL, AV_LOG_FATAL, "Could not initialize SDL - %s\n", SDL_GetError());
         av_log(NULL, AV_LOG_FATAL, "(Did you set the DISPLAY variable?)\n");
         av_log(NULL, AV_LOG_INFO, "flags: 0x%x\n", flags);
-        exit(1);
+        return ;
     }
 
     SDL_EventState(SDL_SYSWMEVENT, SDL_IGNORE);
@@ -4681,6 +5077,7 @@ int main(int argc, char **argv)
     init_dynload();
 
     av_log_set_flags(AV_LOG_SKIP_REPEATED);
+    av_log_set_callback(ffplaykit_log_callback_function);
     parse_loglevel(argc, argv, options);
 
     /* register all codecs, demux and protocols */
@@ -4739,7 +5136,7 @@ int main(int argc, char **argv)
                 av_log(NULL, AV_LOG_FATAL, "An input file must be specified\n");
                 av_log(NULL, AV_LOG_FATAL,
                        "Use -h to get full help or, even better, run 'man %s'\n", program_name_ffplaykit);
-                exit(1);
+                return -1;
             }
             if (display_disable)
             {
@@ -4749,55 +5146,144 @@ int main(int argc, char **argv)
             VideoState *is = create_video_state();
             is->v_argc = sub_argc;
             is->v_argv = av_mallocz(sizeof(char *) * sub_argc);
-            for (int i = 0; i < is->v_argc; i++)
+            for (int j = 0; j < is->v_argc; j++)
             {
-                is->v_argv[i] = av_strdup(sub_argv[i]);
+                is->v_argv[j] = av_strdup(sub_argv[j]);
             }
             is->filename = av_strdup(input_filename);
             is->iformat = file_iformat;
+            is->vs_index = i;
             group_push_back(video_group, is);
         }
     }
-   
-    // Play
-    VideoState *cur_state = group_front(video_group), *next = NULL;
-    // group_pop(video_group);
-    userControl.prev_vid = NULL;
-    userControl.cur_vid = cur_state;
-    userControl.next_vid = cur_state->next;
-    g_renderer = create_renderer(window);
-    while (cur_state)
-    {
-        // g_renderer = create_renderer(window);
-        ret = stream_open(cur_state);
-        if (ret < 0)
-        {
-            av_log(NULL, AV_LOG_FATAL, "Failed to initialize VideoState!\n");
-            do_exit(NULL);
-        }
-        av_log(NULL, AV_LOG_INFO, "stream_open: %d\n", ret);
 
-        event_loop(cur_state);
-        next = cur_state->next;
-        userControl.next_vid = next;
-        // destroy_renderer(g_renderer);
-        // autoexit, FF_QUIT_EVENT 之后不调do_exit。需要进入下一次播放，只需要做一部分uninit操作。
-        if (cur_state)
+    if (group_size(video_group) <= 0)
+    {
+        av_log(NULL, AV_LOG_FATAL, "No video set. Quit.\n");
+    }
+    else
+    {
+        int ff_toggle_direction = FF_TOGGLE_NEXT_EVENT;
+        VideoState *cur_state = group_front(video_group), *next_state = NULL;
+        cur_state->current = 1;
+        next_state = cur_state->next;
+        g_renderer = create_renderer(window);
+        while (1)
         {
-            av_log(NULL, AV_LOG_INFO, "stream_close\n");
-            stream_close(cur_state);
-        }
-        
+            int cur_e;
+retry:
+            av_log(NULL, AV_LOG_INFO, "Current vs_index: %d\n", cur_state->vs_index);
+            cur_e = vs_get_play_state(cur_state);
+            if (E_PLAY_STATE_STOPPED == cur_e)
+            {
+                ret = vs_open(cur_state, 0);
+                if (ret < 0)
+                {
+                    av_log(NULL, AV_LOG_FATAL, "vs_index: %d. Failed to initialize VideoState!\n", cur_state->vs_index);
+                }
+                av_log(NULL, AV_LOG_INFO, "vs_index: %d. vs_open: %d\n", cur_state->vs_index, ret);
+            }
+            else if (E_PLAY_STATE_HIBERNATION == cur_e)
+            {
+                vs_resume(cur_state);
+            }
+            else if (E_PLAY_STATE_OPENING == cur_e || E_PLAY_STATE_STOPPING == cur_e)
+            {
+                do {
+                    av_usleep((int64_t)(20 * 1000));
+                } while (E_PLAY_STATE_OPENING == (cur_e = vs_get_play_state(cur_state)) || cur_e == E_PLAY_STATE_STOPPING);
+                av_log(NULL, AV_LOG_INFO, "vs_index: %d. cur_state is opening just now. Retry.\n", cur_state->vs_index);
+                goto retry;
+            }
+            else
+            {
+                av_log(NULL, AV_LOG_WARNING, "vs_index: %d. cur_state error play state: %d\n", cur_state->vs_index, cur_e);
+            }
+            // 按照滑动的方向预先打开多个视频
+            VideoState *video_state = cur_state;
+            for (int i = 0; i < VIDEO_BUFFER_NUM; i++)
+            {
+                if (FF_TOGGLE_NEXT_EVENT == ff_toggle_direction)
+                    video_state = video_state->next;
+                else if (FF_TOGGLE_PREV_EVENT == ff_toggle_direction)
+                    video_state = video_state->prev;
+                else
+                    break;
+                if (video_state)
+                {
+                    av_log(NULL, AV_LOG_INFO, "vs_index: %d. To open for preparation.\n", video_state->vs_index);
+                    int vs_e = vs_get_play_state(video_state);
+                    while (vs_e == E_PLAY_STATE_STOPPING)
+                    {
+                        av_usleep((int64_t)(20 * 1000));
+                        vs_e = vs_get_play_state(video_state);
+                    }
+                    if (E_PLAY_STATE_STOPPED == vs_e) {
+                        ret = vs_open(video_state, 1);
+                        if (ret < 0)
+                            av_log(NULL, AV_LOG_FATAL, "vs_index: %d. vs_open for preparation failed: %d.\n", video_state->vs_index, ret);
+                    }
+                    av_log(NULL, AV_LOG_INFO, "vs_index: %d. After preparation. pict num: %d\n", video_state->vs_index, frame_queue_nb_remaining(&video_state->pictq));
+                } else 
+                    break;
+            }
+            ff_toggle_direction = event_loop(cur_state);
+            if (FF_TOGGLE_NEXT_EVENT == ff_toggle_direction || FF_TOGGLE_PREV_EVENT == ff_toggle_direction)
+            {
+                video_state = cur_state;
+                for (int i = 0; i < VIDEO_BUFFER_NUM; i++)
+                {
+                    if (FF_TOGGLE_NEXT_EVENT == ff_toggle_direction)
+                        video_state = video_state->prev;
+                    else if (FF_TOGGLE_PREV_EVENT == ff_toggle_direction)
+                        video_state = video_state->next;
+                    else 
+                        break;
+                    if (!video_state)
+                        break;
+                }
+                if (video_state && E_PLAY_STATE_STOPPED != vs_get_play_state(video_state))
+                    vs_close(video_state);
+                vs_hibernate(cur_state);
+                cur_state->current = 0;
+                if (FF_TOGGLE_NEXT_EVENT == ff_toggle_direction)
+                    cur_state = cur_state->next;
+                else if (FF_TOGGLE_PREV_EVENT == ff_toggle_direction)
+                    cur_state = cur_state->prev;
+                else 
+                    break;
+                if (cur_state)
+                    cur_state->current = 1;
+                else
+                    break; // 没有视频了，退出。正常不应当走到这里，在SLIP_OUT时就判断过有没有上/下一个视频
+            }
+            else if (FF_QUIT_EVENT == ff_toggle_direction)
+            {
+                VideoState *vs = group_front(video_group);
+                while(vs) {
+                    while (E_PLAY_STATE_STOPPING == vs->play_state)
+                    {
+                        av_usleep(10 * 1000);
+                    }
+                    if (E_PLAY_STATE_STOPPED != vs->play_state) {
+                        vs_close(vs);
+                    }
+                    vs = vs->next;
+                }
+                break;
+            }
+
 #if CONFIG_AVFILTER
             av_freep(&vfilters_list);
 #endif
-        if (show_status)
-            printf("\n");
-        // av_log(NULL, AV_LOG_QUIET, "%s", "");
-        av_log(NULL, AV_LOG_INFO, "Once play end\n");
-        cur_state = next;
+            if (show_status)
+                printf("\n");
+            // av_log(NULL, AV_LOG_QUIET, "%s", "");
+            // av_log(NULL, AV_LOG_INFO, "Once play end\n");
+            // cur_state = next_state;
+        }
+        destroy_renderer(g_renderer);
     }
-    destroy_renderer(g_renderer);
     uninit_opts();
     av_log(NULL, AV_LOG_INFO, "uninit_opts\n");
 /*     if (renderer)
@@ -4810,7 +5296,7 @@ int main(int argc, char **argv)
     avformat_network_deinit();
     SDL_Quit();
     av_log(NULL, AV_LOG_QUIET, "%s", "");
-    exit(0);
+    // exit(0); // Native代码不应该自己结束进程，而是让ui线程返回给java
     return 0;
 
 }
@@ -4928,7 +5414,7 @@ void ffplaykit_set_touch_action_up(float x, float y)
     if (fabsf(y - touch_down_xy[1]) > 1000)
     {
         LOGI("Touch up cause exchange next video\n");
-        atomic_store(&userControl.slide_state, E_SLIDE_SLIP_OUT);
+        atomic_store(&userControl.slide_state, E_SLIDE_SLIP_OUT_UP);
     }
     else
     {

@@ -7,6 +7,15 @@ import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
 
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
 import android.app.*;
 import android.content.*;
 import android.content.res.Configuration;
@@ -127,6 +136,41 @@ public class SDLActivity extends Activity {
        }
     }
 
+    public List<String> getMp4Links(String directoryUrl) {
+        List<String> result = new ArrayList<>();
+        try {
+            URL url = new URL(directoryUrl);
+            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn.setConnectTimeout(5000);
+            conn.setReadTimeout(5000);
+
+            BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(conn.getInputStream()));
+
+            String line;
+            // 只匹配 href="xxx.mp4"
+            Pattern pattern = Pattern.compile("href\\s*=\\s*\"([^\"]+\\.mp4)\"", Pattern.CASE_INSENSITIVE);
+
+            while ((line = reader.readLine()) != null) {
+                Matcher matcher = pattern.matcher(line);
+                while (matcher.find()) {
+                    String relativeOrFull = matcher.group(1);
+                    String fullUrl = relativeOrFull.startsWith("http")
+                            ? relativeOrFull
+                            : directoryUrl + relativeOrFull;
+                    result.add(fullUrl);
+                }
+            }
+
+            reader.close();
+
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+
+        return result;
+    }
+
     /**
      * This method is called by SDL before starting the native application thread.
      * It can be overridden to provide the arguments after the application name.
@@ -137,6 +181,9 @@ public class SDLActivity extends Activity {
         // return new String[0];
         // /storage/emulated/0/UltimatClarity_h264_1080p.mp4
         // /storage/emulated/0/TrumpTalksSocialism.mp4
+
+        List<String> mp4Links = getMp4Links("http://192.168.43.130:8088/media/mp4/shorts/");
+
         String[] str = new String[] { 
             /* "-i", "/storage/emulated/0/1_MyFile/short_videos/ALuTPKL_POEEng9R.mp4",
             "-autoexit", "-loop", "-1",
@@ -150,7 +197,8 @@ public class SDLActivity extends Activity {
             "-i", "/storage/emulated/0/1_MyFile/short_videos/OKsMpsYifRPT_8eC.mp4",
             "-autoexit", "-loop", "-1" */    
             // caYLAMXGGjslZLYO_540x1278.mp4
-                "-i", "/storage/emulated/0/1_MyFile/short_videos/caYLAMXGGjslZLYO_540x1278.mp4",
+
+                /* "-i", "/storage/emulated/0/1_MyFile/short_videos/caYLAMXGGjslZLYO_540x1278.mp4",
                 "-autoexit", "-loop", "-1",
                 "delimiter",
                 "-i", "/storage/emulated/0/1_MyFile/short_videos/Hqk31W3TNI.mp4",
@@ -163,9 +211,62 @@ public class SDLActivity extends Activity {
                 "-autoexit", "-loop", "-1",
                 "delimiter",
                 "-i", "/storage/emulated/0/1_MyFile/short_videos/SongChiGan.mp4",
-                "-autoexit", "-loop", "-1"               
+                "-autoexit", "-loop", "-1" */   
+
+                /* 
+            "-i", "http://192.168.43.135:8088/media/mp4/shorts/-OFC2V3IkvOmQv3Z.mp4",
+            "-autoexit", "-loop", "-1",   
+            "delimiter", 
+            "-i", "http://192.168.43.135:8088/media/mp4/shorts/-rWj0Ocj08hNgyg9.mp4",
+            "-autoexit", "-loop", "-1",
+                "delimiter",
+                    "-i", "http://192.168.43.135:8088/media/mp4/shorts/ALuTPKL_POEEng9R.mp4",
+            "-autoexit", "-loop", "-1",
+                "delimiter",
+                    "-i", "http://192.168.43.135:8088/media/mp4/shorts/Hqk31W3TNI.mp4",
+            "-autoexit", "-loop", "-1",
+                "delimiter",
+                    "-i", "http://192.168.43.135:8088/media/mp4/shorts/KrHWtM4JbxcieFnK.mp4",
+            "-autoexit", "-loop", "-1",
+                "delimiter",
+                    "-i", "http://192.168.43.135:8088/media/mp4/shorts/Massimo.mp4",
+            "-autoexit", "-loop", "-1",
+                "delimiter",
+                    "-i", "http://192.168.43.135:8088/media/mp4/shorts/Monrowl.mp4",
+            "-autoexit", "-loop", "-1",
+                "delimiter",
+                    "-i", "http://192.168.43.135:8088/media/mp4/shorts/OKsMpsYifRPT_8eC.mp4",
+            "-autoexit", "-loop", "-1",
+                "delimiter",
+                    "-i", "http://192.168.43.135:8088/media/mp4/shorts/R1ur7SWSr1qa2hTF.mp4",
+            "-autoexit", "-loop", "-1",
+                "delimiter",
+                    "-i", "http://192.168.43.135:8088/media/mp4/shorts/SXoUU-seSL_it5pn.mp4",
+            "-autoexit", "-loop", "-1",
+                "delimiter",
+                    "-i", "http://192.168.43.135:8088/media/mp4/shorts/SongChiGan.mp4",
+            "-autoexit", "-loop", "-1" */
+                            
         };
-        return str;
+
+        List<String> args = new ArrayList<>();
+
+        for (int i = 0; i < mp4Links.size(); i++) {
+            String url = mp4Links.get(i);
+            args.add("-i");
+            args.add(url);
+            args.add("-autoexit");
+            args.add("-loop");
+            args.add("-1");
+
+            // 只有不是最后一个时才加 "delimiter"
+            if (i < mp4Links.size() - 1) {
+                args.add("delimiter");
+            }
+        }
+        /* for (int i = 0; i < args.size(); i++)
+            Log.v(TAG, args.get(i)); */
+        return args.toArray(new String[0]);
     }
 
     public static void initialize() {
