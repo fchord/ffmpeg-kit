@@ -501,9 +501,11 @@ static _Atomic float touch_move_xy[2] = {0.0, 0.0}; // 手指实时的坐标
 static _Atomic float touch_up_xy[2] = {0.0, 0.0}; // 手指抬起时的坐标
 #define LONG_DISTANCE 1200
 #define SHORT_DISTANCE 120
-#define THRESHOLD_TIME 150
+#define THRESHOLD_TIME 300
 
 #define VIDEO_BUFFER_NUM 3
+
+static int switch_mode = 2;
 
 /**
  * 速度平滑运动算法
@@ -609,20 +611,42 @@ speedSmoothMove(float step_time, float lastX, float lastY, float startX, float s
 static void speedUpMoveOut(float step_time, float lastX, float lastY, float startX, float startY, float endX, float endY,
                            float accelFactor, float *currentX, float *currentY, float initialSpeedX, float initialSpeedY)
 {
-    float avg_speed_x = (endX - startX) / 150, avg_speed_y = (endY - startY) / 150;
+    float avg_speed_x = (endX - startX) / 500, avg_speed_y = (endY - startY) / 500;
     /* float init_speed_x = initialSpeedX == 0.0 ? avg_speed_x / 2 : initialSpeedX;
     float init_speed_y = initialSpeedY == 0.0 ? avg_speed_y / 2 : initialSpeedY;
     float cur_speed_x = (lastX - startX) / (endX - startX) * (avg_speed_x - init_speed_x) + init_speed_x;
     float cur_speed_y = (lastY - startY) / (endY - startY) * (avg_speed_y - init_speed_y) + init_speed_y; */
     // av_log(NULL, AV_LOG_INFO, "speedUpMoveOut. initialSpeed: [%f, %f], avg_speed: [%f, %f] \n", initialSpeedX, initialSpeedY, avg_speed_x, avg_speed_y);
-    if (fabsf(step_time * avg_speed_x) > fabsf(lastX - endX))
+
+    // 计算运动距离
+    float totalX = endX - startX;
+    float totalY = endY - startY;
+    float passedX = lastX - startX;
+    float passedY = lastY - startY;
+
+    if (totalX == 0.0 && totalY == 0.0)
+    {
+        *currentX = endX;
+        *currentY = endY;
+        return;
+    }
+    float progress = sqrt(pow(passedX, 2) + pow(passedY, 2)) / sqrt(pow(totalX, 2) + pow(totalY, 2));
+    /* if (progress >= 1.0) {
+        *currentX = endX;
+        *currentY = endY;
+        return;
+    } */
+    // 加速滑出
+    float step_x = step_time * avg_speed_x * (1.0 + progress);
+    if (fabsf(step_x) > fabsf(lastX - endX))
         *currentX = endX;
     else
-        *currentX = lastX + step_time * avg_speed_x;
-    if (fabsf(step_time * avg_speed_y) > fabsf(lastY - endY))
+        *currentX = lastX + step_x;
+    float step_y = step_time * avg_speed_y * (1.0 + progress);
+    if (fabsf(step_y) > fabsf(lastY - endY))
         *currentY = endY;
     else
-        *currentY = lastY + step_time * avg_speed_y;
+        *currentY = lastY + step_y;
     return;
 }
 
@@ -1471,7 +1495,10 @@ static void video_image_display(VideoState *is)
     Frame *vp;
     Frame *sp = NULL;
     SDL_Rect rect;
-    // av_log(NULL, AV_LOG_INFO, "video_image_display. vs_index: %d\n", is->vs_index);
+    SDL_FPoint offset;
+    int order = 0;
+
+    // av_log(NULL, AV_LOG_INFO, "video_image_display. vs_index: %d. xleft: %d, ytop: %d, width: %d, height: %d\n", is->vs_index, is->xleft, is->ytop, is->width, is->height);
     if ( frame_queue_nb_remaining(&is->pictq) == 0 ) {
         av_log(NULL, AV_LOG_INFO, "video_image_display. frame queue nb is 0.\n");
     }
@@ -1533,22 +1560,18 @@ static void video_image_display(VideoState *is)
 
     calculate_display_rect(&rect, is->xleft, is->ytop, is->width, is->height, vp->width, vp->height, vp->sar);
     // 视频滑动时的坐标偏移
-    rect.x += userControl.current_video_xy[0];
-    rect.y += userControl.current_video_xy[1];
-    // 当该视频不是播放中的视频
+    offset.x = userControl.current_video_xy[0];
+    offset.y = userControl.current_video_xy[1];
     if (!is->current) {
-        if (is->prev && 1 == is->prev->current && userControl.current_video_xy[1] < 0) { // 下一个视频，且用户向上滑
-            rect.y += is->height;
-            // av_log(NULL, AV_LOG_INFO, "video_image_display. it's is->next. rect.y: %d. is->height: %d\n", rect.y, is->height);
+        if (is->prev && 1 == is->prev->current ) { // 下一个视频
+            order = 1;
         }
-        else if (is->next && 1 == is->next->current && userControl.current_video_xy[1] > 0) { // 上一个视频，且用户向下滑
-            rect.y -= is->height;
-            // av_log(NULL, AV_LOG_INFO, "video_image_display. it's is->prev. rect.y: %d. is->height: %d\n", rect.y, is->height);
+        else if (is->next && 1 == is->next->current ) { // 上一个视频
+            order = -1;
         }
         else
             return;
     }       
-    // av_log(NULL, AV_LOG_INFO, "video_image_display. vs_index: %d, rect: [%d, %d, %d, %d]\n", is->vs_index, rect.x, rect.y, rect.w, rect.h);
     set_sdl_yuv_conversion_mode(vp->frame);
 
     if (!vp->uploaded)
@@ -1563,10 +1586,9 @@ static void video_image_display(VideoState *is)
         vp->uploaded = 1;
         vp->flip_v = vp->frame->linesize[0] < 0;
     }
-    // av_log(NULL, AV_LOG_INFO, "render in video_image_display. %d\n", is->video_frame_rendered);
     static double angle = 0.0;
     // 渲染一帧
-    SDL_RenderCopyEx(g_renderer, is->vid_texture, NULL, &rect, angle, NULL, vp->flip_v ? SDL_FLIP_VERTICAL : 0);
+    SDL_RenderCopyEx(g_renderer, is->vid_texture, NULL, &rect, angle, NULL, &offset, order, vp->flip_v ? SDL_FLIP_VERTICAL : 0);
     // angle += 1.0;
     is->video_frame_rendered++;
     set_sdl_yuv_conversion_mode(NULL);
@@ -1934,23 +1956,17 @@ static void video_display(VideoState *is)
         video_open(is->next);
     if (is->prev && !is->prev->width)
         video_open(is->prev);
+
     SDL_SetRenderDrawColor(g_renderer, 0, 0, 0, 255);
     SDL_RenderClear(g_renderer);
     if (is->audio_st && is->show_mode != SHOW_MODE_VIDEO)
         video_audio_display(is);
     else if (is->video_st) {
-        // av_log(NULL, AV_LOG_INFO, "video_image_display current: %d, vs_index: %d, play_state: %d\n", is->current, is->vs_index, is->play_state);
         video_image_display(is);
-        if (is->next && userControl.current_video_xy[1] < 0)
-        {
-            // av_log(NULL, AV_LOG_INFO, "video_image_display next. vs_index: %d, play_state: %d\n", is->next->vs_index, is->next->play_state);
+        if (is->next)
             video_image_display(is->next);
-        }
-        if (is->prev && userControl.current_video_xy[1] > 0)
-        {
-            // av_log(NULL, AV_LOG_INFO, "video_image_display prev. vs_index: %d, play_state: %d\n", is->prev->vs_index, is->prev->play_state);
+        if (is->prev)
             video_image_display(is->prev);
-        }
     }
     SDL_RenderPresent(g_renderer);
 }
@@ -4139,11 +4155,8 @@ static void refresh_loop_wait_event(VideoState *is, SDL_Event *event)
             av_usleep((int64_t)(remaining_time * 1000000.0));
         remaining_time = REFRESH_RATE; // 如果没有调video_refresh更新它的值，也至少保证 sleep 5毫秒
 
-        // bool allow_slip_up = (is->next) ? true : false, allow_slip_down = (is->prev) ? true : false;
-
         int is_on_now = atomic_load(&touch_on);
         int is_on_last = atomic_load(&touch_on_last);
-        /* if ((touch_move_xy[0] != 0.0 || touch_move_xy[1] != 0.0) || (touch_move_xy[0] == 0.0 && touch_move_xy[1] == 0.0 && (userControl.last_video_xy[0] != 0.0 || userControl.last_video_xy[1] != 0.0))) */
         int s;
         if ((E_SLIDE_OFF != (s = atomic_load(&userControl.slide_state))) || !(!is_on_last && !is_on_now))
         {
@@ -4164,15 +4177,15 @@ static void refresh_loop_wait_event(VideoState *is, SDL_Event *event)
                     atomic_store(&touch_on_last, is_on_now);
                 } else if (E_SLIDE_FOLLOWING == s && (is_on_last && is_on_now)) {
                     // 持续被按下
-                    float down_x[2] = {atomic_load(&touch_down_xy[0]), atomic_load(&touch_down_xy[1])},
+                    float down_xy[2] = {atomic_load(&touch_down_xy[0]), atomic_load(&touch_down_xy[1])},
                           move_xy[2] = {atomic_load(&touch_move_xy[0]), atomic_load(&touch_move_xy[1])};
-                    userControl.current_video_xy[0] = userControl.last_video_xy[0] = move_xy[0] - down_x[0] + userControl.press_video_xy[0];
-                    userControl.current_video_xy[1] = userControl.last_video_xy[1] = move_xy[1] - down_x[1] + userControl.press_video_xy[1];
+                    userControl.current_video_xy[0] = userControl.last_video_xy[0] = move_xy[0] - down_xy[0] + userControl.press_video_xy[0];
+                    userControl.current_video_xy[1] = userControl.last_video_xy[1] = move_xy[1] - down_xy[1] + userControl.press_video_xy[1];
                     /* av_log(NULL, AV_LOG_INFO, "E_SLIDE_FOLLOWING. touch_move_xy: [%f, %f], touch_down_xy: [%f, %f], userControl.press_video_xy: [%f, %f]\n",
-                           move_xy[0], move_xy[1], down_x[0], down_x[1], userControl.press_video_xy[0], userControl.press_video_xy[1]);
+                           move_xy[0], move_xy[1], down_xy[0], down_xy[1], userControl.press_video_xy[0], userControl.press_video_xy[1]);
                     av_log(NULL, AV_LOG_INFO, "E_SLIDE_FOLLOWING. current_x: %f, current_y: %f\n", userControl.current_video_xy[0], userControl.current_video_xy[1]); */
                 } else if (E_SLIDE_FOLLOWING == s && (is_on_last && !is_on_now)) {
-                    // 松开
+                    // 松开一瞬间
                     userControl.touch_up_time = av_gettime();
                     // 记录松开时视频的坐标
                     userControl.release_video_xy[0] = userControl.current_video_xy[0];
@@ -4237,9 +4250,6 @@ static void refresh_loop_wait_event(VideoState *is, SDL_Event *event)
                         /* av_log(NULL, AV_LOG_INFO, "E_SLIDE_BACK. diff_time: %f, current_x: %f, current_y: %f\n",
                                diff_time,
                                is->current_video_xy[0], is->current_video_xy[1]); */
-                        /* SDL_SetVertexPositionOffset(g_renderer,
-                                                    userControl.last_video_xy[0] = current_x,
-                                                    userControl.last_video_xy[1] = current_y); */
                         // atomic_store(&rect_offset_x, userControl.last_video_xy[0] = current_x);
                         // atomic_store(&rect_offset_y, userControl.last_video_xy[1] = current_y);
                         userControl.last_video_xy[0] = userControl.current_video_xy[0];
@@ -4286,9 +4296,6 @@ static void refresh_loop_wait_event(VideoState *is, SDL_Event *event)
                         av_log(NULL, AV_LOG_INFO, "E_SLIDE_SLIP_OUT_UP. diff_time: %f, current_x: %f, current_y: %f\n",
                                diff_time,
                                userControl.current_video_xy[0], userControl.current_video_xy[1]);
-                        /* SDL_SetVertexPositionOffset(g_renderer,
-                                                    userControl.last_video_xy[0] = current_x,
-                                                    userControl.last_video_xy[1] = current_y); */
                         // atomic_store(&rect_offset_x, userControl.last_video_xy[0] = current_x);
                         // atomic_store(&rect_offset_y, userControl.last_video_xy[1] = current_y);
                         userControl.last_video_xy[0] = userControl.current_video_xy[0];
@@ -4967,11 +4974,11 @@ SDL_Renderer *create_renderer(SDL_Window *window)
     SDL_Renderer *renderer;
     if (window)
     {
-        renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+        renderer = SDL_CreateRenderer(window, -1, switch_mode, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
         if (!renderer)
         {
             av_log(NULL, AV_LOG_WARNING, "Failed to initialize a hardware accelerated renderer: %s\n", SDL_GetError());
-            renderer = SDL_CreateRenderer(window, -1, 0);
+            renderer = SDL_CreateRenderer(window, -1, switch_mode, 0);
         }
         if (renderer)
         {
@@ -5371,30 +5378,18 @@ JNIEXPORT jint JNICALL Java_org_libsdl_app_FFplayKit_nativeFFplayPositionOffset(
 }
 
 void ffplaykit_set_position_offset(float x, float y) {
-    atomic_store(&touch_move_xy[0], 100); /* x - touch_down_xy[0] */ ;                                          // 只允许上下滑动
-    atomic_store(&touch_move_xy[1], y);                                                                  /* - touch_down_xy[1] */
-    ;
-    // LOGI("ffplaykit_set_position_offset:[%f, %f]", x, y);
-/*     if (0 && renderer) {
-        LOGI("ffplaykit_set_position_offset call SDL:[%f, %f]", x, y);
-        SDL_SetVertexPositionOffset(renderer,
-                                    touch_move_xy[0],
-                                    touch_move_xy[1]);
-    }
-         */
+    atomic_store(&touch_move_xy[0], x);
+    atomic_store(&touch_move_xy[1], y);
 }
 
 void ffplaykit_set_touch_action_down(float x, float y)
 {
     LOGI("ffplaykit_set_touch_action_down: [%f, %f]", x, y);
-    atomic_store(&touch_down_xy[0], 100.0);  // 只允许上下滑动
-    atomic_store(&touch_down_xy[1],y);
-    atomic_store(&touch_move_xy[0], 100);
+    atomic_store(&touch_down_xy[0], x);
+    atomic_store(&touch_down_xy[1], y);
+    atomic_store(&touch_move_xy[0], x);
     atomic_store(&touch_move_xy[1], y);
-
     atomic_store(&touch_on, 1);
-    //atomic_store(&userControl.touch_state, true);
-    // atomic_store(&userControl.slide_state, E_SLIDE_FOLLOWING);
 }
 
 void ffplaykit_set_touch_action_up(float x, float y)
@@ -5402,23 +5397,10 @@ void ffplaykit_set_touch_action_up(float x, float y)
     LOGI("ffplaykit_set_touch_action_up: [%f, %f]", x, y);
     if (1 == atomic_load(&touch_on))
     {
-        atomic_store(&touch_up_xy[0], 100) /* x - touch_down_xy[0] */; // 只允许上下滑动
-        atomic_store(&touch_up_xy[1], y) /*  - touch_down_xy[1] */;
+        atomic_store(&touch_up_xy[0], x);
+        atomic_store(&touch_up_xy[1], y);
         atomic_store(&touch_on, 0);
     } else {
         LOGI("ffplaykit_set_touch_action_up: touch_on has been released by code.");
-    }
-
-    //atomic_store(&userControl.touch_state, false);
-    /* 
-    if (fabsf(y - touch_down_xy[1]) > 1000)
-    {
-        LOGI("Touch up cause exchange next video\n");
-        atomic_store(&userControl.slide_state, E_SLIDE_SLIP_OUT_UP);
-    }
-    else
-    {
-        atomic_store(&userControl.slide_state, E_SLIDE_BACK);
-    } */
-    
+    }    
 }
