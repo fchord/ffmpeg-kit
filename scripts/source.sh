@@ -197,9 +197,9 @@ get_library_source() {
     SOURCE_TYPE="TAG"
     ;;
   sdl)
-    SOURCE_REPO_URL="https://github.com/arthenica/SDL"
-    SOURCE_ID="release-2.0.8"
-    SOURCE_TYPE="TAG"
+    SOURCE_REPO_URL="https://github.com/fchord/SDL"
+    SOURCE_ID="fa10bef2f6ca025359c0534463b7e4508c8f094a"
+    SOURCE_TYPE="COMMIT"
     ;;
   shine)
     SOURCE_REPO_URL="https://github.com/arthenica/shine"
